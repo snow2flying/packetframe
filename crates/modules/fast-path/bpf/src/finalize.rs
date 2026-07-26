@@ -17,17 +17,14 @@
 //! `docs/runbooks/tail-call-architecture.md`.
 
 use aya_ebpf::{
-    bindings::xdp_action,
-    helpers::bpf_xdp_adjust_head,
-    macros::xdp,
-    maps::lpm_trie::Key,
+    bindings::xdp_action, helpers::bpf_xdp_adjust_head, macros::xdp, maps::lpm_trie::Key,
     programs::XdpContext,
 };
 use network_types::ip::{IpProto, Ipv4Hdr, Ipv6Hdr};
 
 use crate::maps::{
-    bump_stat, StatIdx, CFG, MSS_CLAMP_BY_IFACE, MSS_CLAMP_V4, MSS_CLAMP_V6, MUTATION_CTX,
-    REDIRECT_DEVMAP,
+    bump, stats_base, StatIdx, StatsPtr, FP_CFG_FLAG_MSS_CLAMP_PRESENT, MSS_CLAMP_BY_IFACE,
+    MSS_CLAMP_V4, MSS_CLAMP_V6, MUTATION_CTX, REDIRECT_DEVMAP,
 };
 
 /// 802.1Q TPID. Mirror of `main::TPID_8021Q`; kept local so finalize
@@ -52,6 +49,14 @@ const MAX_IP_OFFSET: usize = 64;
 
 #[xdp]
 pub fn finalize(ctx: XdpContext) -> u32 {
+    // Own STATS lookup: finalize is a separate program stage and the
+    // pointer cannot cross the tail-call boundary. Fail open on the
+    // unreachable None (index 0 of a 1-entry per-CPU array).
+    let stats = match stats_base() {
+        Some(s) => s,
+        None => return xdp_action::XDP_PASS,
+    };
+
     // Read the per-CPU mutation context written by fast_path right
     // before its tail_call. Always present in production; fail-safe
     // XDP_PASS if missing so traffic falls through to kernel rather
@@ -59,7 +64,7 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     let mctx = match unsafe { MUTATION_CTX.get(0) } {
         Some(c) => *c,
         None => {
-            bump_stat(StatIdx::ErrMutationCtx);
+            bump(stats, StatIdx::ErrMutationCtx);
             return xdp_action::XDP_PASS;
         }
     };
@@ -84,6 +89,11 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     // for a future second VLAN tag without having to revisit this.
     let ip_offset = mctx.ip_offset as usize;
     if ip_offset > MAX_IP_OFFSET {
+        // Previously an uncounted XDP_PASS — and by finalize time the
+        // packet is already mutated (TTL, MACs), so this fail-open is
+        // a half-mutated frame handed to the kernel. Unreachable while
+        // fast_path writes only 14/18; count it so layout drift screams.
+        bump(stats, StatIdx::ErrCtxOffsetRange);
         return xdp_action::XDP_PASS;
     }
 
@@ -91,20 +101,40 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     // via bpf_xdp_adjust_head). mss-clamp's TCP-options walk relies on
     // ip_offset being valid relative to ctx.data(), true until VLAN
     // push/pop changes the layout.
-    mss_clamp_inline(&ctx, ip_offset, is_v4, egress_ifindex);
+    //
+    // Gated on MSS_CLAMP_PRESENT (carried across the tail call in
+    // mctx.cfg_flags): with no mss-clamp configured, the entire clamp
+    // chain — previously 3 LPM/hash lookups + a CFG read for EVERY
+    // forwarded TCP packet — costs one register test. The bit is set
+    // whenever any clamp source exists, so gating can never skip a
+    // configured clamp.
+    if mctx.cfg_flags & u16::from(FP_CFG_FLAG_MSS_CLAMP_PRESENT) != 0 {
+        mss_clamp_inline(
+            &ctx,
+            stats,
+            ip_offset,
+            is_v4,
+            egress_ifindex,
+            mctx.mss_clamp_global,
+        );
+    }
 
     if apply_vlan_egress(&ctx, ingress_vid, egress_vid).is_err() {
-        bump_stat(StatIdx::ErrVlan);
+        bump(stats, StatIdx::ErrVlan);
         return xdp_action::XDP_ABORTED;
     }
 
     match REDIRECT_DEVMAP.redirect(egress_ifindex, 0) {
         Ok(_) => {
-            bump_stat(StatIdx::FwdOk);
+            bump(stats, StatIdx::FwdOk);
             xdp_action::XDP_REDIRECT
         }
         Err(_) => {
-            bump_stat(StatIdx::ErrFibOther);
+            // Devmap entry vanished between fast_path's pre-check and
+            // here, or the kernel refused the redirect. Dedicated
+            // counter (v0.2.8): this used to bump ErrFibOther, hiding
+            // redirect-time failures inside the FIB-error bucket.
+            bump(stats, StatIdx::ErrRedirectFailed);
             xdp_action::XDP_PASS
         }
     }
@@ -124,11 +154,18 @@ pub fn finalize(ctx: XdpContext) -> u32 {
 /// loses the verifier's bound-tracking when the cast is reached: see
 /// `R9 offset is outside of the packet` from the v0.2.5 prerelease build.
 #[inline(always)]
-fn mss_clamp_inline(ctx: &XdpContext, ip_offset: usize, is_v4: bool, egress_ifindex: u32) {
+fn mss_clamp_inline(
+    ctx: &XdpContext,
+    stats: StatsPtr,
+    ip_offset: usize,
+    is_v4: bool,
+    egress_ifindex: u32,
+    global_clamp: u16,
+) {
     if is_v4 {
-        mss_clamp_v4(ctx, ip_offset, egress_ifindex);
+        mss_clamp_v4(ctx, stats, ip_offset, egress_ifindex, global_clamp);
     } else {
-        mss_clamp_v6(ctx, ip_offset, egress_ifindex);
+        mss_clamp_v6(ctx, stats, ip_offset, egress_ifindex, global_clamp);
     }
 }
 
@@ -136,7 +173,13 @@ fn mss_clamp_inline(ctx: &XdpContext, ip_offset: usize, is_v4: bool, egress_ifin
 /// directly to `*const Ipv4Hdr`. Mirrors the `ptr_at` pattern from
 /// main.rs that the verifier accepts.
 #[inline(always)]
-fn mss_clamp_v4(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
+fn mss_clamp_v4(
+    ctx: &XdpContext,
+    stats: StatsPtr,
+    ip_offset: usize,
+    egress_ifindex: u32,
+    global_clamp: u16,
+) {
     let start = ctx.data();
     let end = ctx.data_end();
     if start + ip_offset + Ipv4Hdr::LEN > end {
@@ -147,16 +190,31 @@ fn mss_clamp_v4(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
     if proto != PROTO_TCP {
         return;
     }
-    let clamp = lookup_mss_clamp_v4(ip, egress_ifindex);
+    // SYN hoist: clamp policy only ever applies to SYN/SYN-ACK, and
+    // established-flow packets are the overwhelming bulk of TCP. Read
+    // the flags byte (2-byte-cheap) BEFORE the up-to-three clamp map
+    // lookups; pre-hoist, every established TCP packet paid all of
+    // them just to bail at the same flag test inside mss_clamp_tcp.
+    // No counter change: non-SYN packets never bumped anything.
+    if !tcp_syn_flag_set(start, end, ip_offset + Ipv4Hdr::LEN) {
+        return;
+    }
+    let clamp = lookup_mss_clamp_v4(ip, egress_ifindex, global_clamp);
     if clamp == 0 {
         return;
     }
-    mss_clamp_tcp(ctx, ip as *const u8, Ipv4Hdr::LEN, clamp);
+    mss_clamp_tcp(ctx, stats, ip as *const u8, Ipv4Hdr::LEN, clamp);
 }
 
 /// IPv6 path: same pattern as `mss_clamp_v4` but with a 40-byte bound.
 #[inline(always)]
-fn mss_clamp_v6(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
+fn mss_clamp_v6(
+    ctx: &XdpContext,
+    stats: StatsPtr,
+    ip_offset: usize,
+    egress_ifindex: u32,
+    global_clamp: u16,
+) {
     let start = ctx.data();
     let end = ctx.data_end();
     if start + ip_offset + Ipv6Hdr::LEN > end {
@@ -167,11 +225,30 @@ fn mss_clamp_v6(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
     if proto != PROTO_TCP {
         return;
     }
-    let clamp = lookup_mss_clamp_v6(ip, egress_ifindex);
+    // SYN hoist; see mss_clamp_v4.
+    if !tcp_syn_flag_set(start, end, ip_offset + Ipv6Hdr::LEN) {
+        return;
+    }
+    let clamp = lookup_mss_clamp_v6(ip, egress_ifindex, global_clamp);
     if clamp == 0 {
         return;
     }
-    mss_clamp_tcp(ctx, ip as *const u8, Ipv6Hdr::LEN, clamp);
+    mss_clamp_tcp(ctx, stats, ip as *const u8, Ipv6Hdr::LEN, clamp);
+}
+
+/// Read TCP header byte 13 (flags) at `tcp_offset` and test SYN.
+/// Out-of-bounds → `false` (a truncated TCP header can't be a
+/// clampable SYN; mirrors the fail-open shape of `icmpv6_type` in
+/// main.rs). Bounds check uses the accepted `start + off + k > end`
+/// pattern; `tcp_offset` is `ip_offset + <const HDR>` where fast_path
+/// already clamped `ip_offset` ≤ MAX_IP_OFFSET.
+#[inline(always)]
+fn tcp_syn_flag_set(start: usize, end: usize, tcp_offset: usize) -> bool {
+    if start + tcp_offset + 14 > end {
+        return false;
+    }
+    let flags = unsafe { *((start + tcp_offset + 13) as *const u8) };
+    flags & TCP_FLAG_SYN != 0
 }
 
 /// Walk the TCP-options block of a matched SYN/SYN-ACK and mutate the MSS
@@ -195,7 +272,13 @@ fn mss_clamp_v6(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
 /// exploration tractable (a 40-iteration walk hit the verifier's
 /// 1M-instruction limit during v0.2.4 development).
 #[inline(always)]
-fn mss_clamp_tcp(ctx: &XdpContext, ip_ptr: *const u8, ip_hdr_size: usize, clamp: u16) {
+fn mss_clamp_tcp(
+    ctx: &XdpContext,
+    stats: StatsPtr,
+    ip_ptr: *const u8,
+    ip_hdr_size: usize,
+    clamp: u16,
+) {
     let start = ctx.data();
     let end = ctx.data_end();
 
@@ -221,7 +304,7 @@ fn mss_clamp_tcp(ctx: &XdpContext, ip_ptr: *const u8, ip_hdr_size: usize, clamp:
     let tcp_hdr_len = doff_words * 4;
     let opts_len = tcp_hdr_len - 20;
     if opts_len == 0 {
-        bump_stat(StatIdx::MssClampSkipped);
+        bump(stats, StatIdx::MssClampSkipped);
         return;
     }
     if start + tcp_offset + tcp_hdr_len > end {
@@ -281,9 +364,9 @@ fn mss_clamp_tcp(ctx: &XdpContext, ip_ptr: *const u8, ip_hdr_size: usize, clamp:
                     *csum_p = new_csum_be[0];
                     *csum_p.add(1) = new_csum_be[1];
                 }
-                bump_stat(StatIdx::MssClampApplied);
+                bump(stats, StatIdx::MssClampApplied);
             } else {
-                bump_stat(StatIdx::MssClampSkipped);
+                bump(stats, StatIdx::MssClampSkipped);
             }
             found = true;
             break;
@@ -292,7 +375,7 @@ fn mss_clamp_tcp(ctx: &XdpContext, ip_ptr: *const u8, ip_hdr_size: usize, clamp:
     }
 
     if !found {
-        bump_stat(StatIdx::MssClampSkipped);
+        bump(stats, StatIdx::MssClampSkipped);
     }
 }
 
@@ -305,7 +388,7 @@ fn csum_replace_u16(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
 }
 
 #[inline(always)]
-fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32) -> u16 {
+fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32, global_clamp: u16) -> u16 {
     {
         let key = Key::new(32, unsafe { (*ip).src_addr });
         if let Some(entry) = MSS_CLAMP_V4.get(&key) {
@@ -327,14 +410,15 @@ fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32) -> u16 {
             return *mss;
         }
     }
-    if let Some(c) = CFG.get(0) {
-        return c.mss_clamp_global;
-    }
-    0
+    // Global fallback from MutationCtx (fast_path's single CFG read);
+    // finalize no longer touches the CFG map. Precedence order among
+    // the four sources (prefix-src, prefix-dst, iface, global) is
+    // unchanged per SPEC.
+    global_clamp
 }
 
 #[inline(always)]
-fn lookup_mss_clamp_v6(ip: *const Ipv6Hdr, egress_ifindex: u32) -> u16 {
+fn lookup_mss_clamp_v6(ip: *const Ipv6Hdr, egress_ifindex: u32, global_clamp: u16) -> u16 {
     {
         let key = Key::new(128, unsafe { (*ip).src_addr });
         if let Some(entry) = MSS_CLAMP_V6.get(&key) {
@@ -356,10 +440,8 @@ fn lookup_mss_clamp_v6(ip: *const Ipv6Hdr, egress_ifindex: u32) -> u16 {
             return *mss;
         }
     }
-    if let Some(c) = CFG.get(0) {
-        return c.mss_clamp_global;
-    }
-    0
+    // See lookup_mss_clamp_v4: global fallback rides in MutationCtx.
+    global_clamp
 }
 
 // --- VLAN choreography (relocated from main.rs in v0.2.5) -----------------

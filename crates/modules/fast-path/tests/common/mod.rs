@@ -38,19 +38,24 @@ use packetframe_fast_path::{
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs`. Must track
 /// `linux_impl::FpCfg`, if you change one, change both (and both's
 /// ordering in the StatIdx enum at the same time).
+///
+/// Layout V2 (v0.2.4): the formerly-`_reserved [u8; 2]` slot is
+/// `mss_clamp_global: u16` (0 = unset), matching what production
+/// userspace writes. The pre-fix mirror only worked because both
+/// interpretations were all-zeroes in tests.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct FpCfg {
     pub dry_run: u8,
     pub flags: u8,
-    pub _reserved: [u8; 2],
+    pub mss_clamp_global: u16,
     pub version: u32,
 }
 
 unsafe impl Pod for FpCfg {}
 
-pub const FP_CFG_VERSION_V1: u32 = 0;
-pub const STATS_COUNT: u32 = 38;
+pub const FP_CFG_VERSION_V2: u32 = 1;
+pub const STATS_COUNT: u32 = 40;
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
 /// uses these to flip forwarding modes on the live BPF program.
@@ -60,6 +65,9 @@ pub const FP_CFG_FLAG_IPV6: u8 = 0b0000_0010;
 pub const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 pub const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
 pub const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
+pub const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
+pub const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
+pub const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
 
 /// Wire-format counter indices (SPEC.md §4.6). Append-only once v0.1
 /// ships; never renumber.
@@ -105,6 +113,8 @@ pub enum StatIdx {
     ErrTailCall = 35,
     ErrMutationCtx = 36,
     PassNdp = 37,
+    ErrCtxOffsetRange = 38,
+    ErrRedirectFailed = 39,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a
@@ -183,8 +193,8 @@ impl Harness {
         harness.set_cfg(FpCfg {
             dry_run: 0,
             flags: 0b11,
-            _reserved: [0; 2],
-            version: FP_CFG_VERSION_V1,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
         });
         harness
     }
@@ -199,9 +209,93 @@ impl Harness {
         self.set_cfg(FpCfg {
             dry_run: u8::from(on),
             flags: 0b11,
-            _reserved: [0; 2],
-            version: FP_CFG_VERSION_V1,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
         });
+    }
+
+    /// Write an arbitrary `FpCfg.flags` byte (dry-run off, no global
+    /// clamp). Tests exercising the feature-presence gate bits (5-7)
+    /// compose exactly the flag combination they need.
+    pub fn set_cfg_flags(&mut self, flags: u8) {
+        self.set_cfg(FpCfg {
+            dry_run: 0,
+            flags,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
+        });
+    }
+
+    /// Insert an IPv4 prefix into the BLOCK_V4 trie. Callers must also
+    /// set `FP_CFG_FLAG_BLOCK_PRESENT` for the XDP program to consult
+    /// it — mirroring the userspace invariant that the bit is derived
+    /// from the same directives that populate the map.
+    pub fn add_block_v4(&mut self, prefix: &str) {
+        let (addr, plen) = parse_v4_prefix(prefix);
+        let map = self.bpf.map_mut("BLOCK_V4").expect("BLOCK_V4 map");
+        let mut trie: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(map).expect("LpmTrie try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(&key, 1u8, 0).expect("BLOCK_V4 insert");
+    }
+
+    /// Insert an IPv4 mss-clamp prefix rule. `iface_filter` 0 = any
+    /// egress. Callers must also set `FP_CFG_FLAG_MSS_CLAMP_PRESENT`.
+    pub fn add_mss_clamp_v4(&mut self, prefix: &str, mss: u16, iface_filter: u32) {
+        /// Layout mirror of `MssClampValue` in `bpf/src/maps.rs`.
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct MssClampValue {
+            mss: u16,
+            _pad: u16,
+            iface_filter: u32,
+        }
+        unsafe impl Pod for MssClampValue {}
+
+        let (addr, plen) = parse_v4_prefix(prefix);
+        let map = self.bpf.map_mut("MSS_CLAMP_V4").expect("MSS_CLAMP_V4 map");
+        let mut trie: LpmTrie<_, [u8; 4], MssClampValue> =
+            LpmTrie::try_from(map).expect("MSS_CLAMP_V4 try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(
+            &key,
+            MssClampValue {
+                mss,
+                _pad: 0,
+                iface_filter,
+            },
+            0,
+        )
+        .expect("MSS_CLAMP_V4 insert");
+    }
+
+    /// Insert a VLAN-subif mapping: `subif_ifindex` → (physical parent
+    /// ifindex, VID). Callers must also set `FP_CFG_FLAG_VLAN_PRESENT`.
+    pub fn add_vlan_resolve(&mut self, subif_ifindex: u32, phys_ifindex: u32, vid: u16) {
+        use aya::maps::HashMap as AyaHashMap;
+
+        /// Layout mirror of `VlanResolve` in `bpf/src/maps.rs`.
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct VlanResolve {
+            phys_ifindex: u32,
+            vid: u16,
+            _pad: u16,
+        }
+        unsafe impl Pod for VlanResolve {}
+
+        let map = self.bpf.map_mut("VLAN_RESOLVE").expect("VLAN_RESOLVE map");
+        let mut hm: AyaHashMap<_, u32, VlanResolve> =
+            AyaHashMap::try_from(map).expect("VLAN_RESOLVE try_from");
+        hm.insert(
+            subif_ifindex,
+            VlanResolve {
+                phys_ifindex,
+                vid,
+                _pad: 0,
+            },
+            0,
+        )
+        .expect("VLAN_RESOLVE insert");
     }
 
     /// Insert an IPv4 prefix into the allowlist. `prefix` is
@@ -239,8 +333,8 @@ impl Harness {
         self.set_cfg(FpCfg {
             dry_run: 0,
             flags,
-            _reserved: [0; 2],
-            version: FP_CFG_VERSION_V1,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
         });
     }
 
@@ -398,6 +492,29 @@ impl Harness {
     /// bytes). The kernel may have mutated the packet (L2 rewrite, TTL
     /// decrement) on XDP_REDIRECT; the output buffer reflects that.
     pub fn run(&self, packet: &[u8]) -> (u32, Vec<u8>) {
+        let (retval, _duration, out) = test_run_xdp_repeat(self.fast_path_fd(), packet, 1);
+        (retval, out)
+    }
+
+    /// Run the BPF program `repeat` times against `packet` in a single
+    /// `BPF_PROG_TEST_RUN` syscall and return `(verdict, avg_ns)`,
+    /// where `avg_ns` is the kernel-reported mean nanoseconds per
+    /// iteration (`bpf_attr.test.duration`). The verdict is from the
+    /// final iteration.
+    ///
+    /// **The kernel reuses one packet buffer across all `repeat`
+    /// iterations within a syscall**, so mutations accumulate: a
+    /// forwarded packet has its TTL decremented every pass. Benchmarks
+    /// of the forward path must build packets with a large TTL (255)
+    /// and keep `repeat` below 253, or later iterations silently
+    /// measure the `PassLowTtl` path instead. Each new syscall starts
+    /// from the pristine `packet` again.
+    pub fn run_timed(&self, packet: &[u8], repeat: u32) -> (u32, u32) {
+        let (retval, duration, _out) = test_run_xdp_repeat(self.fast_path_fd(), packet, repeat);
+        (retval, duration)
+    }
+
+    fn fast_path_fd(&self) -> i32 {
         let prog: &Xdp = self
             .bpf
             .program("fast_path")
@@ -405,15 +522,18 @@ impl Harness {
             .try_into()
             .expect("program is XDP");
         let prog_fd: &ProgramFd = prog.fd().expect("program loaded");
-        test_run_xdp(prog_fd.as_fd().as_raw_fd(), packet)
+        prog_fd.as_fd().as_raw_fd()
     }
 
-    /// Aggregate a PerCpuArray stat across all CPUs.
+    /// Aggregate a stat across all CPUs. v0.2.8+ STATS shape: one
+    /// per-CPU entry holding the whole `[u64; STATS_COUNT]` block;
+    /// `StatIdx` discriminants are offsets into it.
     pub fn stat(&self, idx: StatIdx) -> u64 {
         let map = self.bpf.map("STATS").expect("STATS map");
-        let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map).expect("PerCpuArray try_from");
-        let per_cpu = stats.get(&(idx as u32), 0).expect("STATS get");
-        per_cpu.iter().copied().sum()
+        let stats: PerCpuArray<_, [u64; STATS_COUNT as usize]> =
+            PerCpuArray::try_from(map).expect("PerCpuArray try_from");
+        let per_cpu = stats.get(&0, 0).expect("STATS get");
+        per_cpu.iter().map(|block| block[idx as usize]).sum()
     }
 }
 
@@ -443,7 +563,9 @@ struct TestRunAttr {
 
 const BPF_PROG_TEST_RUN: u32 = 10;
 
-fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
+/// Returns `(retval, duration_ns, data_out)`. `duration_ns` is the
+/// kernel's mean nanoseconds per iteration across `repeat` runs.
+fn test_run_xdp_repeat(prog_fd: i32, packet: &[u8], repeat: u32) -> (u32, u32, Vec<u8>) {
     // XDP programs may grow the packet (VLAN push: +4). Allocate
     // output with headroom so the kernel doesn't truncate.
     let mut data_out = vec![0u8; packet.len() + 256];
@@ -461,7 +583,7 @@ fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
     attr.data_size_out = data_out.len() as u32;
     attr.data_in = packet.as_ptr() as u64;
     attr.data_out = data_out.as_mut_ptr() as u64;
-    attr.repeat = 1;
+    attr.repeat = repeat;
 
     let ret = unsafe {
         libc::syscall(
@@ -478,7 +600,7 @@ fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
     }
 
     data_out.truncate(attr.data_size_out as usize);
-    (attr.retval, data_out)
+    (attr.retval, attr.duration, data_out)
 }
 
 // --- Prefix parsing ---------------------------------------------------
@@ -510,6 +632,12 @@ pub struct Ipv4TcpBuilder {
     pub tos: u8,
     pub frag_flags: u16, // network byte order: bit 15=res, 14=DF, 13=MF, 12..0=offset
     pub ihl: u8,         // normally 5; set >5 to produce IHL>5 via header option bytes
+    pub tcp_flags: u8,   // TCP header byte 13; default SYN (0x02)
+    /// Raw TCP option bytes appended after the fixed 20-byte header.
+    /// Must be a multiple of 4 (padded with NOPs/EOL by the caller);
+    /// data offset is derived. E.g. an MSS option for 1460:
+    /// `vec![2, 4, 0x05, 0xb4]`.
+    pub tcp_options: Vec<u8>,
     pub payload: Vec<u8>,
 }
 
@@ -526,6 +654,8 @@ impl Default for Ipv4TcpBuilder {
             tos: 0,
             frag_flags: 0,
             ihl: 5,
+            tcp_flags: 0x02, // SYN, the historical builder default
+            tcp_options: Vec::new(),
             payload: Vec::new(),
         }
     }
@@ -546,8 +676,13 @@ pub fn insert_vlan_tag(base: &[u8], vid: u16) -> Vec<u8> {
 
 impl Ipv4TcpBuilder {
     pub fn build(&self) -> Vec<u8> {
+        assert!(
+            self.tcp_options.len() % 4 == 0 && self.tcp_options.len() <= 40,
+            "tcp_options must be 4-byte padded and fit the doff field"
+        );
         let ip_header_len = (self.ihl as usize) * 4;
-        let total_len = (ip_header_len + 20 + self.payload.len()) as u16; // +TCP hdr
+        let tcp_header_len = 20 + self.tcp_options.len();
+        let total_len = (ip_header_len + tcp_header_len + self.payload.len()) as u16;
         let mut pkt = Vec::with_capacity(14 + total_len as usize);
 
         // Ethernet
@@ -578,15 +713,18 @@ impl Ipv4TcpBuilder {
         let csum = ipv4_checksum(ip_header);
         pkt[check_offset..check_offset + 2].copy_from_slice(&csum.to_be_bytes());
 
-        // TCP (minimal 20-byte header; flags = SYN; no options)
+        // TCP header; flags from `tcp_flags`, options from `tcp_options`.
         pkt.extend_from_slice(&self.src_port.to_be_bytes());
         pkt.extend_from_slice(&self.dst_port.to_be_bytes());
         pkt.extend_from_slice(&[0, 0, 0, 1]); // seq
         pkt.extend_from_slice(&[0, 0, 0, 0]); // ack
-        pkt.push(0x50); // data offset 5 in upper nibble
-        pkt.push(0x02); // SYN
+        let doff_words = (tcp_header_len / 4) as u8;
+        pkt.push(doff_words << 4); // data offset in upper nibble
+        pkt.push(self.tcp_flags);
         pkt.extend_from_slice(&[0xff, 0xff]); // window
-        pkt.extend_from_slice(&[0, 0, 0, 0]); // checksum (zero - bpf doesn't care for fixtures)
+        pkt.extend_from_slice(&[0, 0]); // checksum (zero - bpf recomputes incrementally)
+        pkt.extend_from_slice(&[0, 0]); // urgent pointer
+        pkt.extend_from_slice(&self.tcp_options);
 
         pkt.extend_from_slice(&self.payload);
         pkt
