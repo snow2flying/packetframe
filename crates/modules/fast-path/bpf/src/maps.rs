@@ -183,12 +183,32 @@ pub enum StatIdx {
     /// Packet forwarded by `tc_finalize` via `bpf_redirect` (bumped in
     /// addition to `FwdOk`). A/B attribution mirror of `RxTotalTc`.
     FwdOkTc = 41,
+    // --- FIB destination cache (default-off experiment). Append-only.
+    //
+    // The three probe outcomes are mutually exclusive per packet, so
+    // hit rate = hit / (hit + miss + stale). They are a layer ON TOP
+    // of the route-decision counters: a cache-hit packet still bumps
+    // `CustomFibHit` (it IS a FIB hit) and `EcmpHashV4/V6` where
+    // applicable — cache counters describe the probe, not the verdict.
+    /// Cache probe matched (dst equal, generation current); the LPM
+    /// walk was skipped.
+    FibCacheHit = 42,
+    /// Cache enabled but the slot was empty or held a different dst
+    /// (collision / cold working set). The LPM walk ran and the slot
+    /// was refilled.
+    FibCacheMiss = 43,
+    /// Slot held the right dst but a stale generation — a route change
+    /// invalidated it since fill. Distinct from Miss because the two
+    /// have opposite remedies: sustained Stale means BGP churn defeats
+    /// the global-generation invalidation; sustained Miss means the
+    /// working set outsizes the table (or collisions dominate).
+    FibCacheStale = 44,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 42;
+pub const STATS_COUNT: u32 = 45;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
@@ -699,6 +719,111 @@ pub static ECMP_GROUPS: Array<EcmpGroup> = Array::with_max_entries(ECMP_GROUPS_M
 /// index 0. Separate from `CFG` to avoid evolving `FpCfg`.
 #[map]
 pub static FIB_CONFIG: Array<FpFibCfg> = Array::with_max_entries(1, 0);
+
+// --- FIB destination cache (default-off experiment) ----------------------
+//
+// A direct-mapped per-CPU cache in front of the FIB LPM tries. The
+// tries hold a full BGP table, so a production lookup is a deep
+// DRAM-bound walk (~1.2 µs/pkt measured on cn9670); the cache converts
+// repeat destinations into one array probe. Design constraints:
+//
+// - The cached value is the FibValue (kind + idx), NEVER the resolved
+//   nexthop tuple: the per-packet seqlock read and the ECMP 5-tuple
+//   hash run unchanged on hits, so neighbor churn requires no
+//   invalidation and per-flow ECMP placement is preserved bit-for-bit.
+// - Key is the full /32 (v4) or /128 (v6) destination — FibValue does
+//   not record the matched prefix length, so no coarser key is sound.
+// - Direct-mapped PerCpuArray, not an LRU map: no LRU type is proven
+//   on the 5.15-ui verifier, LRU insert is an alloc-under-spinlock
+//   helper call per miss, and under adversarial dst spray LRU degrades
+//   to eviction-list thrash (the failure mode that killed the Linux
+//   route cache) while direct-mapped degrades to baseline-plus-two-
+//   helper-calls. Collisions simply overwrite.
+// - Invalidation is a global generation stamped into each entry at
+//   fill: the FibProgrammer bumps `FIB_CACHE_CFG.generation` on every
+//   LPM mutation, logically flushing the whole cache; it refills at
+//   line rate. Generation 0 is RESERVED (never valid): kernel
+//   zero-init means an untouched slot is `{dst:0, generation:0}`, so
+//   no false hit is possible for any dst under any live generation —
+//   no init pass needed.
+// - No negative caching: LPM misses are not cached (rare under a full
+//   table, and a stale negative entry is a blackhole-shaped bug).
+//
+// All-u32 fields: zero padding by construction (compile-time asserted)
+// and field-by-field stores — the MutationCtx anti-memset discipline.
+
+/// v4 cache entry. 24 bytes, zero padding (the `_pad` field is
+/// explicit and stored, keeping the anti-memset discipline intact
+/// under the u64 alignment).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct FibCacheEntryV4 {
+    /// Destination address, native-endian word of the wire bytes.
+    pub dst: u32,
+    /// `FibValue.kind` widened to u32 (avoids u8-plus-padding stores).
+    pub kind: u32,
+    /// `FibValue.idx`.
+    pub idx: u32,
+    /// Explicit padding; always stored as 0.
+    pub _pad: u32,
+    /// `FIB_CACHE_CFG.generation` at fill time. 0 = never filled.
+    /// u64: at one bump per route mutation, wrap is unreachable in any
+    /// deployment lifetime, so a slot never revisited across a full
+    /// generation cycle can never see its stale stamp become live
+    /// again (the u32 flaw review round 3 caught).
+    pub generation: u64,
+}
+const _: () = assert!(core::mem::size_of::<FibCacheEntryV4>() == 24);
+
+/// v6 cache entry. 32 bytes, zero padding by construction.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct FibCacheEntryV6 {
+    /// Destination address as 4 native-endian words of the wire bytes.
+    pub dst: [u32; 4],
+    pub kind: u32,
+    pub idx: u32,
+    pub generation: u64,
+}
+const _: () = assert!(core::mem::size_of::<FibCacheEntryV6>() == 32);
+
+/// Cache control: enable flag + current generation. One entry, sole
+/// writer is the userspace FibProgrammer task (the enable directive
+/// travels to it over the programmer's command channel — reconcile
+/// never touches this map, keeping the programmer/reconcile writer
+/// domains disjoint). Kernel zero-init = disabled.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct FibCacheCfg {
+    /// 0 = off (default), 1 = on.
+    pub enabled: u32,
+    /// Explicit padding; always written as 0.
+    pub _pad: u32,
+    /// Current generation. 0 reserved (never issued), so a zeroed
+    /// entry can never match. u64 — see `FibCacheEntryV4::generation`.
+    pub generation: u64,
+}
+const _: () = assert!(core::mem::size_of::<FibCacheCfg>() == 16);
+
+/// v4 slot count. Power of two (the probe masks with N-1). Memory:
+/// 65_536 × 24 B × nr_cpus (≈28 MB on an 18-core cn9670) — sized so a
+/// per-CPU working set in the tens of thousands of destinations keeps
+/// collision churn low at ~36 kpps/CPU.
+pub const FIB_CACHE_V4_ENTRIES: u32 = 65_536;
+/// v6 slot count. Smaller: v6 traffic share is materially lower on the
+/// target deployments. 16_384 × 32 B × nr_cpus ≈ 9 MB.
+pub const FIB_CACHE_V6_ENTRIES: u32 = 16_384;
+
+#[map]
+pub static FIB_CACHE_V4: PerCpuArray<FibCacheEntryV4> =
+    PerCpuArray::with_max_entries(FIB_CACHE_V4_ENTRIES, 0);
+
+#[map]
+pub static FIB_CACHE_V6: PerCpuArray<FibCacheEntryV6> =
+    PerCpuArray::with_max_entries(FIB_CACHE_V6_ENTRIES, 0);
+
+#[map]
+pub static FIB_CACHE_CFG: Array<FibCacheCfg> = Array::with_max_entries(1, 0);
 
 // --- Stat increment helpers ----------------------------------------------
 

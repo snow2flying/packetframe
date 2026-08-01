@@ -81,7 +81,22 @@ pub fn l4_ports(start: usize, end: usize, offset: usize, proto: u8) -> (u16, u16
 /// Bounds-check shape mirrors [`l4_ports`].
 #[inline(always)]
 pub fn icmpv6_type(start: usize, end: usize, offset: usize) -> Option<u8> {
-    if start + offset + 1 > end {
+    // Bounds-check 4 bytes even though only 1 is read, and the 4 is
+    // load-bearing — do not "fix" it back to 1. Verifier history
+    // (v0.2.8 FIB-cache PR, two failed qemu-5.15 rounds): with k = 1,
+    // LLVM strength-reduces `p + 1 > end` (and the equivalent
+    // `p >= end`) into the reversed strict compare
+    // `if pkt_end > pkt+off goto read`, and the 5.15 verifier's range
+    // propagation for exactly that arm is off by one — the taken
+    // branch keeps r = off where off+1 is provable, and the 1-byte
+    // read at `off` is rejected ("R2 offset is outside of the
+    // packet"). `p + 4 > end` cannot collapse into a >= form, so LLVM
+    // emits the pkt-on-the-left shape (`if pkt+off+4 > pkt_end goto
+    // bail`) whose fall-through range every kernel tracks correctly.
+    // Semantically free: 4 bytes (type, code, checksum) is the ICMPv6
+    // header minimum, and a message truncated below that cannot be a
+    // valid NS/NA — "not NDP" is already the fail-safe answer.
+    if start + offset + 4 > end {
         return None;
     }
     Some(unsafe { core::ptr::read_unaligned((start + offset) as *const u8) })

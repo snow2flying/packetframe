@@ -59,8 +59,8 @@ use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
 
 use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::types::{
-    EcmpGroup, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, MAX_ECMP_PATHS, NH_FAMILY_V4,
-    NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED,
+    EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, MAX_ECMP_PATHS,
+    NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED,
 };
 use crate::pin;
 
@@ -147,6 +147,18 @@ impl FibProgrammerHandle {
     /// can `unregister` at its own cadence.
     ///
     /// Non-`Send` callers use the blocking `_sync` variant below.
+    /// Flip the destination cache. Synchronous and runtime-agnostic
+    /// (`try_send`): safe from both tokio (SIGHUP reconcile runs on
+    /// the signal thread) and non-tokio contexts, unlike
+    /// `blocking_send`, which panics inside a runtime. The command
+    /// queue holds 8192 entries; if it is genuinely full the flip is
+    /// dropped with a warning and the next reconcile retries.
+    pub fn set_cache_enabled_nowait(&self, on: bool) {
+        if let Err(e) = self.tx.try_send(Command::SetCacheEnabled { on }) {
+            warn!(on, error = %e, "fib-cache toggle dropped (command queue full or shut down)");
+        }
+    }
+
     pub async fn register_nexthop(&self, ip: IpAddr) -> Result<NexthopId, ProgrammerError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -269,6 +281,8 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
                 Command::MirrorCounts { reply } => {
                     let _ = reply.send((0, 0));
                 }
+                // Fire-and-forget; nothing to record or reply to.
+                Command::SetCacheEnabled { .. } => {}
             }
         }
     });
@@ -296,6 +310,12 @@ enum Command {
     MirrorCounts {
         reply: oneshot::Sender<(usize, usize)>,
     },
+    /// Flip the destination cache on or off. Fire-and-forget: config
+    /// apply and SIGHUP reconcile send this instead of touching
+    /// FIB_CACHE_CFG themselves — the programmer is the map's sole
+    /// writer, which serializes enable flips against generation bumps
+    /// by construction.
+    SetCacheEnabled { on: bool },
 }
 
 /// Per-nexthop state tracked in userspace. Refcount lets multiple
@@ -457,6 +477,28 @@ pub struct FibProgrammer {
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
 
+    // --- Destination cache (v0.2.8, default-off experiment) ---
+    /// FIB_CACHE_CFG handle. `None` in harnesses that don't exercise
+    /// the cache; production (RouteController) always passes `Some`.
+    /// This task is the map's SOLE writer.
+    cache_cfg: Option<Array<MapData, FibCacheCfg>>,
+    /// Mirrors FIB_CACHE_CFG.enabled. Toggled only via
+    /// `Command::SetCacheEnabled`.
+    cache_enabled: bool,
+    /// Current generation. Starts at 1; 0 is the reserved never-valid
+    /// generation that makes kernel-zeroed cache slots unable to
+    /// false-hit. u64: wrap (and therefore stamp reuse against
+    /// never-cleared slots) is unreachable in any deployment lifetime.
+    cache_generation: u64,
+    /// True while a generation publish has failed and no later write
+    /// has succeeded. While wedged (and enabled), the reclaim queue is
+    /// frozen: the kernel may still be validating cached entries
+    /// against the last published generation, so freeing the nexthop /
+    /// ECMP slots those entries reference would convert an unpublished
+    /// bump into a use-after-reclaim misroute. Slots leak (bounded by
+    /// churn during the wedge) instead — strictly the safer failure.
+    cache_publish_wedged: bool,
+
     // --- Proactive resolve (Phase 3.9 fix) ---
     /// Handle to the NeighborResolver. Every newly-allocated nexthop
     /// fires `request_resolve(ip)`. The resolver consults its seeded
@@ -523,6 +565,18 @@ impl FibProgrammer {
             .map_err(|e| ProgrammerError::MapOpen(format!("Array::try_from(ECMP_GROUPS): {e}")))
     }
 
+    /// Open the `FIB_CACHE_CFG` single-entry array from its bpffs pin.
+    pub fn open_fib_cache_cfg(
+        bpffs_root: &Path,
+    ) -> Result<Array<MapData, FibCacheCfg>, ProgrammerError> {
+        let pin_path = pin::map_path(bpffs_root, "FIB_CACHE_CFG");
+        let map_data = MapData::from_pin(&pin_path)
+            .map_err(|e| ProgrammerError::MapOpen(format!("FIB_CACHE_CFG pin open: {e}")))?;
+        let map = Map::Array(map_data);
+        Array::try_from(map)
+            .map_err(|e| ProgrammerError::MapOpen(format!("Array::try_from(FIB_CACHE_CFG): {e}")))
+    }
+
     /// Construct the programmer with all four BPF map handles. Opens
     /// are done by the caller (via [`open_nexthops`](Self::open_nexthops) etc.)
     /// so test harnesses can pass synthetic maps. `events_rx` is the
@@ -540,6 +594,7 @@ impl FibProgrammer {
             fib_v4,
             fib_v6,
             ecmp_groups,
+            None,
             events_rx,
             shutdown,
             None,
@@ -552,11 +607,13 @@ impl FibProgrammer {
     /// this with `None`, leaving resolution to multicast events
     /// only. Production callers (RouteController) MUST pass `Some`
     /// or BGP nexthops will not resolve cleanly.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_resolver(
         nexthops: Array<MapData, NexthopEntry>,
         fib_v4: LpmTrie<MapData, [u8; 4], FibValue>,
         fib_v6: LpmTrie<MapData, [u8; 16], FibValue>,
         ecmp_groups: Array<MapData, EcmpGroup>,
+        cache_cfg: Option<Array<MapData, FibCacheCfg>>,
         events_rx: mpsc::Receiver<NeighEvent>,
         shutdown: CancellationToken,
         neigh_handle: Option<NeighborResolveHandle>,
@@ -584,6 +641,10 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
+                cache_cfg,
+                cache_enabled: false,
+                cache_generation: 1,
+                cache_publish_wedged: false,
                 neigh_handle,
             },
             FibProgrammerHandle { tx: cmd_tx },
@@ -642,6 +703,140 @@ impl FibProgrammer {
             Command::MirrorCounts { reply } => {
                 let _ = reply.send((self.routes_v4.len(), self.routes_v6.len()));
             }
+            Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
+        }
+    }
+
+    // --- Destination cache control ---
+    //
+    // Invariant: `self.cache_enabled` must mirror what a SUCCESSFUL
+    // write last put in the kernel map, because it gates whether
+    // generation bumps are published. If internal state said
+    // "disabled" while the map still said "enabled" (a failed disable
+    // write), route mutations would stop publishing generations and
+    // stale cached FibValues would stay valid past nexthop reclaim —
+    // the exact hazard the generation exists to prevent. Hence:
+    // toggle transitions only commit internal state after the write
+    // succeeds, and a failed publish during a bump is retried once
+    // then escalated loudly (an 8-byte Array::set on a pinned map has
+    // no expected failure mode; if it fails persistently the map is
+    // unwritable and the operator must restart).
+
+    /// Write the (enabled, generation) pair to FIB_CACHE_CFG. Returns
+    /// whether the write succeeded (vacuously true with no handle —
+    /// harness-only construction, where there is no kernel state to
+    /// diverge from).
+    fn write_cache_cfg(&mut self) -> bool {
+        let value = FibCacheCfg {
+            enabled: u32::from(self.cache_enabled),
+            _pad: 0,
+            generation: self.cache_generation,
+        };
+        match &mut self.cache_cfg {
+            Some(map) => match map.set(0, value, 0) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "FIB_CACHE_CFG write failed");
+                    false
+                }
+            },
+            None => true,
+        }
+    }
+
+    /// Advance the generation, skipping the reserved 0.
+    fn advance_generation(&mut self) {
+        self.cache_generation = self.cache_generation.wrapping_add(1);
+        if self.cache_generation == 0 {
+            self.cache_generation = 1;
+        }
+    }
+
+    /// Advance the generation and, when the cache is live, publish it
+    /// — logically flushing every cached entry. Called on every
+    /// successful FIB LPM mutation; skipping the syscall while
+    /// disabled keeps route churn free when the experiment is off.
+    /// A failed publish is retried once, then escalated: an
+    /// unpublished bump leaves previously cached FibValues validating
+    /// against the old generation until the next successful publish,
+    /// which reopens the reclaim window the generation closes.
+    fn bump_cache_generation(&mut self) {
+        self.advance_generation();
+        if !self.cache_enabled {
+            return;
+        }
+        if self.write_cache_cfg() || self.write_cache_cfg() {
+            if self.cache_publish_wedged {
+                info!(
+                    generation = self.cache_generation,
+                    "FIB_CACHE_CFG publish recovered; resuming reclamation"
+                );
+                self.cache_publish_wedged = false;
+            }
+            return;
+        }
+        // Publish failed twice: the kernel keeps validating cached
+        // entries against the LAST PUBLISHED generation, so entries
+        // stamped with it stay live. Freeze reclamation (see
+        // drain_reclaim_queue) until a later publish succeeds —
+        // generations are monotonic, so any successful publish
+        // invalidates everything stamped earlier and the queue becomes
+        // safe to drain again.
+        self.cache_publish_wedged = true;
+        tracing::error!(
+            generation = self.cache_generation,
+            "FIB_CACHE_CFG generation publish failed twice; cached FIB entries cannot \
+             be invalidated — reclamation FROZEN (slots will not be reused) until a \
+             publish succeeds. Disable fib-cache and restart packetframe if this persists"
+        );
+    }
+
+    /// Handle a `SetCacheEnabled` transition. Same-value commands are
+    /// no-ops. A transition always advances the generation before
+    /// publishing, so disable→enable can never resurrect entries
+    /// filled under an earlier enable epoch; disable publishes
+    /// `enabled = 0`, stopping the BPF probe on the next packet.
+    ///
+    /// Internal state commits ONLY on a successful map write: on
+    /// failure the kernel map is unchanged (map array updates are
+    /// atomic), so keeping the previous `cache_enabled` keeps the
+    /// generation-publication policy consistent with what the BPF
+    /// side actually sees, and the next SIGHUP reconcile (which
+    /// resends the directive unconditionally) retries the toggle.
+    fn set_cache_enabled(&mut self, on: bool) {
+        if on == self.cache_enabled {
+            // Same-value commands arrive on every SIGHUP reconcile,
+            // which makes them the natural retry hook for a wedged
+            // publication: if the LAST route mutation was the one
+            // whose publish failed and churn then stopped, nothing
+            // else would ever retry, and the frozen reclaim queue
+            // would hold its slots forever while reconcile claimed
+            // convergence. Publishing the current (enabled,
+            // generation) pair is idempotent; success unfreezes.
+            if self.cache_publish_wedged && self.cache_enabled && self.write_cache_cfg() {
+                info!(
+                    generation = self.cache_generation,
+                    "FIB_CACHE_CFG publish recovered on reconcile retry; resuming reclamation"
+                );
+                self.cache_publish_wedged = false;
+            }
+            return;
+        }
+        self.advance_generation();
+        let prev = self.cache_enabled;
+        self.cache_enabled = on;
+        if self.write_cache_cfg() {
+            info!(
+                enabled = on,
+                generation = self.cache_generation,
+                "fib-cache toggled"
+            );
+        } else {
+            self.cache_enabled = prev;
+            warn!(
+                requested = on,
+                "fib-cache toggle NOT applied (map write failed); kernel state                  unchanged, will retry on next reconcile"
+            );
         }
     }
 
@@ -1171,7 +1366,16 @@ impl FibProgrammer {
                 None => return Ok(()),
             };
             self.delete_fib_entry(&prefix)?;
-            self.reclaim_immediate(rec.fib_value, rec.nexthop_ips);
+            // Grace-deferred even though the LPM entry is gone: with
+            // the destination cache, an in-flight invocation that
+            // passed its generation check microseconds before the
+            // delete's bump can still dereference the cached FibValue.
+            // Freeing the IDs instantly would let `register` reuse the
+            // slot for a different neighbor inside that window
+            // (misroute); 100 ms of slot residency is the entire cost
+            // of closing it, so the deferral is unconditional rather
+            // than cache-gated — one lifecycle, strictly safer.
+            self.reclaim_prior(Some(rec.fib_value), rec.nexthop_ips);
             return Ok(());
         }
 
@@ -1268,19 +1472,6 @@ impl FibProgrammer {
         }
     }
 
-    /// Free a torn-down prefix's resources immediately. Safe because
-    /// the BPF LPM entry has already been removed; lookups return
-    /// no-match right away, so no in-flight reader can dereference
-    /// these IDs after the deletion.
-    fn reclaim_immediate(&mut self, fib: FibValue, nh_ips: Vec<IpAddr>) {
-        if fib.kind == FIB_KIND_ECMP {
-            self.free_ecmp_group(fib.idx);
-        }
-        for ip in nh_ips {
-            let _ = self.unregister(ip);
-        }
-    }
-
     // --- Mirror ops ---
 
     fn lookup_mirror(&self, prefix: &IpPrefix) -> Option<&RouteRecord> {
@@ -1345,12 +1536,20 @@ impl FibProgrammer {
 
     // --- FIB map ops ---
 
+    // The two functions below are the ONLY places the FIB LPM tries
+    // are mutated, which makes them the destination cache's generation
+    // choke points: every successful insert/remove bumps the global
+    // generation (invalidating all cached entries) BEFORE any caller
+    // reclaims nexthop IDs. recompute_fib_entry's no-change shortcut
+    // returns before reaching either, so no-op recomputes during BGP
+    // churn don't flush the cache.
+
     fn write_fib_entry(
         &mut self,
         prefix: &IpPrefix,
         value: FibValue,
     ) -> Result<(), ProgrammerError> {
-        match prefix {
+        let result = match prefix {
             IpPrefix::V4 { addr, prefix_len } => {
                 if self.routes_v4.len() as u32 >= FIB_V4_CAP
                     && !self.routes_v4.contains_key(&(*addr, *prefix_len))
@@ -1373,11 +1572,15 @@ impl FibProgrammer {
                     .insert(&key, value, 0)
                     .map_err(|e| ProgrammerError::MapWrite(format!("FIB_V6 insert: {e}")))
             }
+        };
+        if result.is_ok() {
+            self.bump_cache_generation();
         }
+        result
     }
 
     fn delete_fib_entry(&mut self, prefix: &IpPrefix) -> Result<(), ProgrammerError> {
-        match prefix {
+        let result = match prefix {
             IpPrefix::V4 { addr, prefix_len } => {
                 let key = LpmKey::new(u32::from(*prefix_len), *addr);
                 self.fib_v4
@@ -1390,7 +1593,11 @@ impl FibProgrammer {
                     .remove(&key)
                     .map_err(|e| ProgrammerError::MapWrite(format!("FIB_V6 remove: {e}")))
             }
+        };
+        if result.is_ok() {
+            self.bump_cache_generation();
         }
+        result
     }
 
     // --- ECMP group ops ---
@@ -1495,6 +1702,13 @@ impl FibProgrammer {
     // --- Reclaim queue drain (grace-period release) ---
 
     fn drain_reclaim_queue(&mut self) {
+        // While a generation publish is wedged, cached entries stamped
+        // with the last published generation are still being honored by
+        // the BPF side; releasing the slots they point at would be a
+        // use-after-reclaim. Hold everything until a publish succeeds.
+        if self.cache_publish_wedged && self.cache_enabled {
+            return;
+        }
         let now = Instant::now();
         while let Some(entry) = self.reclaim_queue.front() {
             if entry.release_at > now {
