@@ -25,7 +25,7 @@ use packetframe_common::{
     },
     module::{Attachment, HookType, LoaderCtx, ModuleConfig, ModuleError, ModuleResult},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{aligned_bpf_copy, pin, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 
@@ -132,6 +132,230 @@ pub(crate) fn feature_flags_from_config(
 /// "none", matching `populate_vlan_resolve`'s NotFound handling.
 pub(crate) fn vlan_subifs_present() -> bool {
     read_vlan_config().map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Whether the `bridge-resolve` directive enables the bridge egress
+/// short-circuit. Default (no directive) is `Auto` = enabled; `On` is
+/// a documented synonym for `Auto` (there is nothing to force — an
+/// unprovable topology stays on the kernel path either way).
+pub(crate) fn bridge_resolve_enabled(directives: &[ModuleDirective]) -> bool {
+    let toggle = directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::BridgeResolve(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or_default();
+    !matches!(toggle, ToggleAutoOnOff::Off)
+}
+
+/// One collapsed bridge egress chain: a bridge whose single forwarding
+/// member is a VLAN subif, resolved down to (bridge, underlying device,
+/// VID). `br1337` over `switch0.1337` over `switch0` yields
+/// `("br1337", "switch0", 1337)`.
+pub(crate) type BridgeChain = (String, String, u16);
+
+/// One bridge port as discovery sees it: (member name, eligible).
+/// "Eligible" = brport state forwarding AND unicast flooding enabled —
+/// both are preconditions for the wire-equivalence argument (see
+/// `read_bridge_topology`).
+pub(crate) type BridgeMember = (String, bool);
+
+/// Host bridge topology: each bridge with its member ports.
+pub(crate) type BridgeTopology = Vec<(String, Vec<BridgeMember>)>;
+
+/// Pure core of bridge-chain discovery: which bridges collapse to a
+/// (underlying device, VID) pair the datapath can redirect to directly?
+///
+/// A bridge qualifies iff it has **exactly one member in total** and
+/// that member (a) is in bridge-port state *forwarding* and (b) is a
+/// VLAN subinterface. "Exactly one member, counting non-forwarding
+/// ones" is deliberate: a second member in STP blocking state can
+/// transition to forwarding at any moment, at which point port choice
+/// requires the bridge FDB — which the BPF side cannot consult. A
+/// bridge that doesn't qualify simply keeps today's kernel path.
+///
+/// `bridges`: (bridge name, members as (name, is_forwarding)).
+/// `vlans`: `/proc/net/vlan/config` rows as (subif, vid, parent).
+pub(crate) fn bridge_vlan_chains(
+    bridges: &[(String, Vec<BridgeMember>)],
+    vlans: &[(String, u16, String)],
+) -> Vec<BridgeChain> {
+    let mut out = Vec::new();
+    for (bridge, members) in bridges {
+        let [(member, forwarding)] = members.as_slice() else {
+            continue; // zero or multiple members: not provably collapsible
+        };
+        if !*forwarding {
+            continue;
+        }
+        if let Some((_, vid, parent)) = vlans.iter().find(|(subif, _, _)| subif == member) {
+            out.push((bridge.clone(), parent.clone(), *vid));
+        }
+    }
+    out
+}
+
+/// Bridge-port STP state "forwarding" (`net/bridge/br_private.h`
+/// BR_STATE_FORWARDING). `/sys/class/net/<member>/brport/state` holds
+/// the numeric state.
+const BR_STATE_FORWARDING: &str = "3";
+
+/// Enumerate every bridge on the host with its members and their
+/// forwarding state.
+///
+/// This is a point-in-time sysfs snapshot, converged at attach and on
+/// every SIGHUP — deliberately the same convergence model as every
+/// other discovery-populated map here (`/proc/net/vlan/config` entries,
+/// redirect-target membership). There is no live topology watcher;
+/// membership or STP changes between reconciles keep the previously
+/// proven chain until the next `packetframe reconfigure`. Documented
+/// in the runbook; a netlink link-watcher would introduce a second
+/// writer domain for VLAN_RESOLVE and is out of scope for this slice. A device is a bridge iff
+/// `/sys/class/net/<dev>/bridge` exists; members are the entries of
+/// `<dev>/brif/`. Per-device read failures are skipped (the sysfs tree
+/// is a live snapshot — a device can vanish mid-walk, same tolerance
+/// as `enumerate_redirect_targets`); only a failure to list
+/// `/sys/class/net` itself is an error.
+fn read_bridge_topology() -> std::io::Result<BridgeTopology> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/net")? {
+        let Ok(entry) = entry else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let base = format!("/sys/class/net/{name}");
+        if !std::path::Path::new(&format!("{base}/bridge")).is_dir() {
+            continue;
+        }
+        // A VLAN-filtering bridge consults its per-port VLAN table on
+        // every forward — it can drop, retag, or untag before the
+        // member's own 8021q encapsulation. A single forwarding member
+        // is NOT wire-equivalence proof under filtering, so such
+        // bridges never qualify. (The UniFi brXXXX shape this feature
+        // targets is a classic non-filtering bridge; the VLAN work is
+        // the subif's.) Unreadable counts as filtering-on: refuse
+        // rather than assume.
+        let filtering_off = std::fs::read_to_string(format!("{base}/bridge/vlan_filtering"))
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false);
+        if !filtering_off {
+            debug!(bridge = %name, "bridge skipped: vlan_filtering enabled (or unreadable)");
+            continue;
+        }
+        let Ok(ports) = std::fs::read_dir(format!("{base}/brif")) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for port in ports.flatten() {
+            let Ok(member) = port.file_name().into_string() else {
+                continue;
+            };
+            let brport = format!("/sys/class/net/{member}/brport");
+            let forwarding = std::fs::read_to_string(format!("{brport}/state"))
+                .map(|s| s.trim() == BR_STATE_FORWARDING)
+                .unwrap_or(false);
+            // With unicast flooding off, a destination MAC absent from
+            // the FDB (e.g. a silent host behind a static neighbor, or
+            // right after an FDB flush) is DROPPED by the bridge rather
+            // than emitted through the sole port — so "single member"
+            // stops implying "the bridge would have sent this frame
+            // there". Forwarded frames always carry a resolved unicast
+            // dst MAC, so unicast_flood is the only flood control that
+            // participates in the equivalence; require it on
+            // (unreadable → refuse).
+            let unicast_flood = std::fs::read_to_string(format!("{brport}/unicast_flood"))
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false);
+            // A VLAN member with a non-default egress-qos-map encodes
+            // the mapped PCP into the tag it emits; the datapath's
+            // vlan push writes PCP/DEI 0, so collapsing such a member
+            // would silently flatten wire priority. The map is visible
+            // in /proc/net/vlan/<member> ("EGRESS priority mappings:"
+            // is empty by default) — require it empty. NotFound means
+            // the member isn't a VLAN device at all, which is fine
+            // (such members never match the VLAN join anyway); any
+            // other read failure refuses.
+            let egress_qos_default =
+                match std::fs::read_to_string(format!("/proc/net/vlan/{member}")) {
+                    Ok(content) => content
+                        .lines()
+                        .find(|l| l.contains("EGRESS priority mappings:"))
+                        .map(|l| {
+                            l.split("EGRESS priority mappings:")
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .is_empty()
+                        })
+                        .unwrap_or(false),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+            members.push((member, forwarding && unicast_flood && egress_qos_default));
+        }
+        out.push((name, members));
+    }
+    Ok(out)
+}
+
+/// Discover the currently collapsible bridge chains, or an empty list
+/// when the directive disables the feature. VLAN-config NotFound means
+/// no 8021q subifs exist, so no chain can terminate in one — empty.
+/// Other IO errors propagate (same policy as the VLAN path: a broken
+/// sysfs/procfs read must not silently produce "no entries" while the
+/// gate bit logic runs on).
+pub(crate) fn discover_bridge_chains(
+    directives: &[ModuleDirective],
+) -> std::io::Result<Vec<BridgeChain>> {
+    if !bridge_resolve_enabled(directives) {
+        return Ok(Vec::new());
+    }
+    let vlans = match read_vlan_config() {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    if vlans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bridges = read_bridge_topology()?;
+    let mut chains = bridge_vlan_chains(&bridges, &vlans);
+    // Wire-equivalence also needs the MTU relation: the uncollapsed
+    // path enforces the BRIDGE's MTU (a packet over it gets dropped /
+    // PTB'd by the bridge layer, and the tc datapath's bpf_check_mtu
+    // would test the bridge device). The short-circuit tests the
+    // underlying device instead, so a bridge with a SMALLER MTU than
+    // its underlying device would silently forward packets the bridge
+    // would have refused. Require mtu(bridge) >= mtu(underlying);
+    // anything else keeps the kernel path. Unreadable → refuse.
+    chains.retain(|(bridge, phys, _)| {
+        let mtu = |dev: &str| -> Option<u32> {
+            std::fs::read_to_string(format!("/sys/class/net/{dev}/mtu"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        match (mtu(bridge), mtu(phys)) {
+            (Some(b), Some(p)) if b >= p => true,
+            (Some(b), Some(p)) => {
+                info!(
+                    bridge = %bridge,
+                    bridge_mtu = b,
+                    underlying = %phys,
+                    underlying_mtu = p,
+                    "bridge egress short-circuit skipped: bridge MTU below underlying device"
+                );
+                false
+            }
+            _ => {
+                warn!(bridge = %bridge, underlying = %phys, "bridge short-circuit skipped: MTU unreadable");
+                false
+            }
+        }
+    });
+    Ok(chains)
 }
 
 /// Read-modify-write one `FpCfg.flags` bit on the live CFG map.
@@ -389,9 +613,21 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         // bits 5-7: feature-presence gates (block / vlan / mss-clamp).
         // bit 2 (HEAD_SHIFT_128) is OR'd on later in
         // apply_driver_quirks_cfg for rvu-nicpf attaches.
+        // The VLAN/bridge presence input is an initial seed only:
+        // `populate_vlan_resolve` re-asserts the bit after it actually
+        // inserts entries (subifs and bridge chains share bit 6).
+        // `discover_bridge_chains` errors count as "none" here for the
+        // same reason a vlan read error does in `vlan_subifs_present` —
+        // the authoritative pass in populate_vlan_resolve fails loud.
         flags: 0b11
             | fib_flags
-            | feature_flags_from_config(&mcfg.section.directives, vlan_subifs_present()),
+            | feature_flags_from_config(
+                &mcfg.section.directives,
+                vlan_subifs_present()
+                    || discover_bridge_chains(&mcfg.section.directives)
+                        .map(|c| !c.is_empty())
+                        .unwrap_or(false),
+            ),
         mss_clamp_global,
         version: FP_CFG_VERSION_V2,
     };
@@ -1072,7 +1308,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         }
     }
 
-    populate_vlan_resolve(state)?;
+    populate_vlan_resolve(state, &cfg.section.directives)?;
 
     // Pin program + every §4.5 map so `packetframe status` can read
     // counters from a separate process and `packetframe detach` can
@@ -1961,17 +2197,26 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
     out
 }
 
-/// Populate `vlan_resolve` from `/proc/net/vlan/config`. Each VLAN
-/// subinterface maps its ifindex → (physical parent ifindex, VID) so
-/// the BPF program can push/pop/rewrite per SPEC §4.7 when the FIB
-/// resolves to a subif. Missing `/proc/net/vlan/config` (no 8021q
-/// kernel module loaded) is not an error, we just insert nothing.
-fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
+/// Populate `vlan_resolve` from `/proc/net/vlan/config`, plus — when
+/// `bridge-resolve` allows — the collapsed bridge egress chains from
+/// [`discover_bridge_chains`]. Each VLAN subinterface maps its ifindex
+/// → (physical parent ifindex, VID) so the BPF program can
+/// push/pop/rewrite per SPEC §4.7 when the FIB resolves to a subif;
+/// each qualifying bridge maps its ifindex → (underlying device, VID)
+/// so the datapath skips the software bridge traversal entirely (the
+/// wire frame is identical to what the bridge would emit). Missing
+/// `/proc/net/vlan/config` (no 8021q kernel module loaded) is not an
+/// error — and with no VLAN subifs there can be no bridge chains
+/// either, so both sets are empty together.
+fn populate_vlan_resolve(
+    state: &mut ActiveState,
+    directives: &[ModuleDirective],
+) -> ModuleResult<()> {
     let entries = match read_vlan_config() {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!("/proc/net/vlan/config missing, no VLAN subifs to resolve");
-            return Ok(());
+            Vec::new()
         }
         Err(e) => {
             return Err(ModuleError::other(
@@ -1980,9 +2225,11 @@ fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
             ));
         }
     };
+    let chains = discover_bridge_chains(directives)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("bridge topology read: {e}")))?;
 
-    if entries.is_empty() {
-        info!("/proc/net/vlan/config empty, no VLAN subifs configured");
+    if entries.is_empty() && chains.is_empty() {
+        info!("no VLAN subifs and no collapsible bridges, VLAN_RESOLVE left empty");
         return Ok(());
     }
 
@@ -2015,6 +2262,62 @@ fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
             vid,
             "vlan_resolve populated"
         );
+    }
+
+    // Bridge entries are an optional optimization: failure to install
+    // one (map at capacity, iface vanished mid-walk) must degrade to
+    // "that bridge keeps the kernel path", never abort attach — unlike
+    // the subif entries above, whose absence would mistag real subif
+    // egress. Warn-and-continue per entry.
+    for (bridge_name, phys_name, vid) in chains {
+        let (bridge_idx, phys_idx) =
+            match (if_nametoindex(&bridge_name), if_nametoindex(&phys_name)) {
+                (Ok(b), Ok(p)) => (b, p),
+                _ => {
+                    warn!(bridge = %bridge_name, "bridge short-circuit skipped: iface vanished");
+                    continue;
+                }
+            };
+        let value = VlanResolve {
+            phys_ifindex: phys_idx,
+            vid,
+            _pad: 0,
+        };
+        if let Err(e) = hm.insert(bridge_idx, value, 0) {
+            warn!(
+                bridge = %bridge_name,
+                error = %e,
+                "bridge short-circuit skipped: VLAN_RESOLVE insert failed (bridge keeps the kernel path)"
+            );
+            continue;
+        }
+        info!(
+            bridge = %bridge_name,
+            bridge_idx,
+            phys = %phys_name,
+            phys_idx,
+            vid,
+            "bridge egress short-circuit installed"
+        );
+        // `mss-clamp via <this bridge>` can no longer match: the clamp
+        // lookup keys on the POST-resolve egress ifindex (identical
+        // pre-existing semantics for plain VLAN subifs). Detectable
+        // here, so say it loudly with the fix.
+        for d in directives {
+            if let ModuleDirective::MssClamp {
+                iface: Some(clamp_iface),
+                ..
+            } = d
+            {
+                if *clamp_iface == bridge_name {
+                    warn!(
+                        bridge = %bridge_name,
+                        underlying = %phys_name,
+                        "mss-clamp `via {bridge_name}` will NOT match while the bridge                          egress short-circuit is installed (clamp matching keys on the                          resolved egress ifindex). Scope the clamp `via {phys_name}` or                          set `bridge-resolve off`."
+                    );
+                }
+            }
+        }
     }
 
     // Entries landed → make sure the VLAN_PRESENT gate bit is on, even
@@ -2595,10 +2898,13 @@ pub fn state_dir(state: &ActiveState) -> &Path {
 mod tests {
     use super::gc_thresh3_capacity_warning;
     use super::{
-        feature_flags_from_config, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_MSS_CLAMP_PRESENT,
+        bridge_resolve_enabled, bridge_vlan_chains, discover_bridge_chains,
+        feature_flags_from_config, if_nametoindex, populate_vlan_resolve, ActiveState, FpCfg,
+        VlanResolve, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_MSS_CLAMP_PRESENT,
         FP_CFG_FLAG_VLAN_PRESENT,
     };
-    use packetframe_common::config::ModuleDirective;
+    use aya::maps::Array;
+    use packetframe_common::config::{ModuleDirective, ToggleAutoOnOff};
 
     #[test]
     fn feature_flags_truth_table() {
@@ -2639,6 +2945,78 @@ mod tests {
         );
     }
 
+    /// The pure core of bridge-chain discovery: only a bridge with
+    /// exactly one member, that member forwarding, that member a VLAN
+    /// subif, collapses. Everything else stays on the kernel path.
+    #[test]
+    fn bridge_vlan_chains_truth_table() {
+        let vlans = vec![
+            ("switch0.1337".to_string(), 1337u16, "switch0".to_string()),
+            ("switch0.88".to_string(), 88u16, "switch0".to_string()),
+        ];
+        let m = |name: &str, fwd: bool| (name.to_string(), fwd);
+
+        // Single forwarding member that is a VLAN subif → collapses.
+        let bridges = vec![("br1337".to_string(), vec![m("switch0.1337", true)])];
+        assert_eq!(
+            bridge_vlan_chains(&bridges, &vlans),
+            vec![("br1337".to_string(), "switch0".to_string(), 1337)]
+        );
+
+        // Two members — even with one blocked — never collapses: the
+        // blocked port can transition to forwarding, and then port
+        // choice needs the FDB.
+        let bridges = vec![(
+            "br1337".to_string(),
+            vec![m("switch0.1337", true), m("eth9", false)],
+        )];
+        assert!(bridge_vlan_chains(&bridges, &vlans).is_empty());
+
+        // Single member but not forwarding (STP blocking/disabled).
+        let bridges = vec![("br1337".to_string(), vec![m("switch0.1337", false)])];
+        assert!(bridge_vlan_chains(&bridges, &vlans).is_empty());
+
+        // Single forwarding member that is NOT a VLAN subif.
+        let bridges = vec![("br0".to_string(), vec![m("eth7", true)])];
+        assert!(bridge_vlan_chains(&bridges, &vlans).is_empty());
+
+        // Zero members.
+        let bridges = vec![("brempty".to_string(), vec![])];
+        assert!(bridge_vlan_chains(&bridges, &vlans).is_empty());
+
+        // Mixed host: qualifying and non-qualifying bridges coexist.
+        let bridges = vec![
+            ("br1337".to_string(), vec![m("switch0.1337", true)]),
+            ("br88".to_string(), vec![m("switch0.88", true)]),
+            ("br0".to_string(), vec![m("switch0.1", true)]), // .1 not in vlans
+            (
+                "brmulti".to_string(),
+                vec![m("switch0.88", true), m("switch0.1337", true)],
+            ),
+        ];
+        assert_eq!(
+            bridge_vlan_chains(&bridges, &vlans),
+            vec![
+                ("br1337".to_string(), "switch0".to_string(), 1337),
+                ("br88".to_string(), "switch0".to_string(), 88),
+            ]
+        );
+    }
+
+    /// Directive semantics: absent/auto/on enable, off disables.
+    #[test]
+    fn bridge_resolve_directive_semantics() {
+        assert!(bridge_resolve_enabled(&[]), "default is auto = enabled");
+        for (toggle, want) in [
+            (ToggleAutoOnOff::Auto, true),
+            (ToggleAutoOnOff::On, true),
+            (ToggleAutoOnOff::Off, false),
+        ] {
+            let d = ModuleDirective::BridgeResolve(toggle);
+            assert_eq!(bridge_resolve_enabled(std::slice::from_ref(&d)), want);
+        }
+    }
+
     /// Bits 5-7 must never collide with the established bits 0-4.
     #[test]
     fn presence_bits_are_disjoint_from_legacy_bits() {
@@ -2658,6 +3036,218 @@ mod tests {
         assert_eq!(
             gc_thresh3_capacity_warning(Some(1024), Some(1024), 8192),
             None
+        );
+    }
+
+    /// End-to-end bridge short-circuit against a real topology:
+    /// veth → 802.1Q subif → single-member bridge, then
+    /// populate/reconcile against a genuinely loaded BPF object.
+    /// Proves the sysfs reader (bridge dir, brif members, brport
+    /// state), the VLAN_RESOLVE keying on the bridge ifindex, the
+    /// `bridge-resolve off` rollback purge, and re-enable convergence.
+    ///
+    /// Requires CAP_NET_ADMIN + CAP_BPF + the 8021q module; CI runs it
+    /// under sudo in the qemu matrix.
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+    fn bridge_short_circuit_populate_and_reconcile() {
+        use aya::maps::HashMap as AyaHashMap;
+
+        if !crate::FAST_PATH_BPF_AVAILABLE {
+            eprintln!("BPF stub in effect (no rustup); skipping bridge-resolve test.");
+            return;
+        }
+
+        const VETH_A: &str = "pf-brv0";
+        const VETH_B: &str = "pf-brv1";
+        const SUBIF: &str = "pf-brv0.42";
+        const BRIDGE: &str = "pf-brtst";
+        const VID: u16 = 42;
+
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                // veth del removes the pair + the subif riding on it.
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", VETH_A])
+                    .status();
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", BRIDGE])
+                    .status();
+            }
+        }
+        fn run(cmd: &[&str]) {
+            let st = std::process::Command::new(cmd[0])
+                .args(&cmd[1..])
+                .status()
+                .unwrap_or_else(|e| panic!("spawn `{}`: {e}", cmd.join(" ")));
+            assert!(st.success(), "`{}` failed: {st}", cmd.join(" "));
+        }
+
+        // Idempotent pre-clean, then build the topology.
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", VETH_A])
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", BRIDGE])
+            .status();
+        run(&[
+            "ip", "link", "add", VETH_A, "type", "veth", "peer", "name", VETH_B,
+        ]);
+        let _cleanup = Cleanup;
+        run(&[
+            "ip", "link", "add", "link", VETH_A, "name", SUBIF, "type", "vlan", "id", "42",
+        ]);
+        // STP off (default) → the port enters forwarding as soon as
+        // the link is up.
+        run(&["ip", "link", "add", BRIDGE, "type", "bridge"]);
+        run(&["ip", "link", "set", SUBIF, "master", BRIDGE]);
+        for dev in [VETH_A, VETH_B, SUBIF, BRIDGE] {
+            run(&["ip", "link", "set", dev, "up"]);
+        }
+        // brport/state flips to forwarding asynchronously; poll briefly.
+        let state_path = format!("/sys/class/net/{SUBIF}/brport/state");
+        for _ in 0..50 {
+            if std::fs::read_to_string(&state_path).is_ok_and(|s| s.trim() == "3") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Discovery alone must find exactly our chain (the host may
+        // have other bridges; filter to ours).
+        let auto_cfg =
+            packetframe_common::config::Config::parse("module fast-path\n  bridge-resolve auto\n")
+                .unwrap();
+        let chains =
+            discover_bridge_chains(&auto_cfg.modules[0].directives).expect("bridge topology read");
+        assert!(
+            chains.contains(&(BRIDGE.to_string(), VETH_A.to_string(), VID)),
+            "expected {BRIDGE} → ({VETH_A}, {VID}) in {chains:?}"
+        );
+
+        // Full populate + reconcile against a real BPF object.
+        let bytes = crate::aligned_bpf_copy();
+        let ebpf = aya::Ebpf::load(&bytes).expect("Ebpf::load");
+        let tmp = std::env::temp_dir().join(format!("pf-brtest-{}", std::process::id()));
+        let mut state = ActiveState {
+            ebpf,
+            links: Vec::new(),
+            state_dir: tmp.clone(),
+            bpffs_root: tmp,
+            route_controller: None,
+            attach_settle_time: std::time::Duration::ZERO,
+        };
+
+        let bridge_idx = if_nametoindex(BRIDGE).unwrap();
+        let veth_idx = if_nametoindex(VETH_A).unwrap();
+        let read_entry = |state: &mut ActiveState| -> Option<(u32, u16)> {
+            let map = state.ebpf.map_mut("VLAN_RESOLVE").unwrap();
+            let hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map).unwrap();
+            hm.get(&bridge_idx, 0).ok().map(|v| (v.phys_ifindex, v.vid))
+        };
+        let flag_set = |state: &mut ActiveState| -> bool {
+            let map = state.ebpf.map_mut("CFG").unwrap();
+            let arr: Array<_, FpCfg> = Array::try_from(map).unwrap();
+            arr.get(&0, 0).unwrap().flags & FP_CFG_FLAG_VLAN_PRESENT != 0
+        };
+
+        populate_vlan_resolve(&mut state, &auto_cfg.modules[0].directives)
+            .expect("populate with bridge-resolve auto");
+        assert_eq!(
+            read_entry(&mut state),
+            Some((veth_idx, VID)),
+            "bridge key must map to (underlying device, VID)"
+        );
+        assert!(flag_set(&mut state), "bit 6 must be set after populate");
+
+        // SIGHUP rollback: bridge-resolve off purges the bridge key but
+        // keeps the plain subif entry (it's a normal 8021q resolve).
+        let off_cfg =
+            packetframe_common::config::Config::parse("module fast-path\n  bridge-resolve off\n")
+                .unwrap();
+        let mcfg =
+            packetframe_common::module::ModuleConfig::new(&off_cfg.modules[0], &off_cfg.global);
+        crate::reconcile::reconcile_vlan_resolve(&mut state, &mcfg)
+            .expect("reconcile with bridge-resolve off");
+        assert_eq!(
+            read_entry(&mut state),
+            None,
+            "bridge key must be purged when the directive is off"
+        );
+        {
+            let map = state.ebpf.map_mut("VLAN_RESOLVE").unwrap();
+            let hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map).unwrap();
+            let subif_idx = if_nametoindex(SUBIF).unwrap();
+            assert!(
+                hm.get(&subif_idx, 0).is_ok(),
+                "plain 8021q subif entry must survive bridge-resolve off"
+            );
+        }
+        assert!(
+            flag_set(&mut state),
+            "bit 6 stays set — the subif entries still exist"
+        );
+
+        // Re-enable converges the key back.
+        let mcfg =
+            packetframe_common::module::ModuleConfig::new(&auto_cfg.modules[0], &auto_cfg.global);
+        crate::reconcile::reconcile_vlan_resolve(&mut state, &mcfg)
+            .expect("reconcile with bridge-resolve auto");
+        assert_eq!(read_entry(&mut state), Some((veth_idx, VID)));
+
+        // Same-key value change must converge in ONE reconcile: swap
+        // the bridge's member for a different-VID subif. The bridge
+        // keeps its ifindex, so the full-tuple diff sees an add and a
+        // remove under one key — the remove pass must not delete the
+        // freshly written value (the Codex-found off-by-one-reconcile).
+        run(&["ip", "link", "del", SUBIF]);
+        run(&[
+            "ip",
+            "link",
+            "add",
+            "link",
+            VETH_A,
+            "name",
+            "pf-brv0.43",
+            "type",
+            "vlan",
+            "id",
+            "43",
+        ]);
+        run(&["ip", "link", "set", "pf-brv0.43", "master", BRIDGE]);
+        run(&["ip", "link", "set", "pf-brv0.43", "up"]);
+        let state43 = "/sys/class/net/pf-brv0.43/brport/state";
+        for _ in 0..50 {
+            if std::fs::read_to_string(state43).is_ok_and(|s| s.trim() == "3") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        crate::reconcile::reconcile_vlan_resolve(&mut state, &mcfg)
+            .expect("reconcile after member swap");
+        assert_eq!(
+            read_entry(&mut state),
+            Some((veth_idx, 43)),
+            "value change under a stable bridge key must survive one reconcile"
+        );
+
+        // A VLAN-filtering bridge must never qualify.
+        run(&[
+            "ip",
+            "link",
+            "set",
+            BRIDGE,
+            "type",
+            "bridge",
+            "vlan_filtering",
+            "1",
+        ]);
+        let chains =
+            discover_bridge_chains(&auto_cfg.modules[0].directives).expect("bridge topology read");
+        assert!(
+            !chains.iter().any(|(b, _, _)| b == BRIDGE),
+            "vlan_filtering bridge must be excluded, got {chains:?}"
         );
     }
 

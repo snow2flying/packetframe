@@ -23,9 +23,10 @@ use packetframe_common::{
 use tracing::{info, warn};
 
 use crate::linux_impl::{
-    feature_flags_from_config, fib_flags_from_forwarding_mode, if_nametoindex,
-    mss_clamp_global_value, read_vlan_config, set_cfg_flag, ActiveState, FpCfg, MssClampValue,
-    VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
+    discover_bridge_chains, feature_flags_from_config, fib_flags_from_forwarding_mode,
+    if_nametoindex, mss_clamp_global_value, read_vlan_config, set_cfg_flag, ActiveState, FpCfg,
+    MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT,
+    FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -43,7 +44,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let block_v4 = reconcile_block_v4(state, cfg)?;
     let block_v6 = reconcile_block_v6(state, cfg)?;
     let mss_clamp = reconcile_mss_clamp(state, cfg)?;
-    let vlan = reconcile_vlan_resolve(state)?;
+    let vlan = reconcile_vlan_resolve(state, cfg)?;
     let devmap = reconcile_devmap(state)?;
 
     info!(
@@ -231,7 +232,10 @@ where
     Ok(delta)
 }
 
-fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
+pub(crate) fn reconcile_vlan_resolve(
+    state: &mut ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<DeltaCount> {
     // Rebuild the desired set from /proc/net/vlan/config. Missing file
     // means no VLAN subifs, desired is empty, which will remove any
     // stale entries.
@@ -246,7 +250,44 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
         }
     };
 
-    let desired: HashSet<(u32, u32, u16)> = vlan_entries
+    // Bridge egress short-circuits share this map and bit 6: the
+    // desired set is the UNION of both sources, and only the single
+    // set_cfg_flag below writes the gate. `bridge-resolve off` yields
+    // an empty chain set, which purges any previously installed bridge
+    // keys via the normal diff — the SIGHUP rollback path. Read errors
+    // abort before the flag RMW, same policy as the vlan read above
+    // (never clear the gate on a transient failure while the map still
+    // holds entries).
+    let chains = discover_bridge_chains(&cfg.section.directives)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("bridge topology read: {e}")))?;
+
+    // Same clamp-scoping warning the attach-time population emits: an
+    // `mss-clamp via <bridge>` cannot match while that bridge is
+    // collapsed (matching keys on the post-resolve egress ifindex).
+    // A SIGHUP can introduce either half of the collision — the clamp
+    // rule or the alias — so the check has to live here too.
+    for (bridge_name, phys_name, _) in &chains {
+        for d in &cfg.section.directives {
+            if let ModuleDirective::MssClamp {
+                iface: Some(clamp_iface),
+                ..
+            } = d
+            {
+                if clamp_iface == bridge_name {
+                    warn!(
+                        bridge = %bridge_name,
+                        underlying = %phys_name,
+                        "mss-clamp `via {bridge_name}` will NOT match while the bridge \
+                         egress short-circuit is installed (clamp matching keys on the \
+                         resolved egress ifindex). Scope the clamp `via {phys_name}` or \
+                         set `bridge-resolve off`."
+                    );
+                }
+            }
+        }
+    }
+
+    let desired_subifs: HashSet<(u32, u32, u16)> = vlan_entries
         .iter()
         .filter_map(|(subif, vid, parent)| {
             // Skip entries whose ifindexes don't resolve, the proc
@@ -257,6 +298,21 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
             Some((subif_idx, phys_idx, *vid))
         })
         .collect();
+    let desired_bridges: HashSet<(u32, u32, u16)> = chains
+        .iter()
+        .filter_map(|(bridge, phys, vid)| {
+            let bridge_idx = if_nametoindex(bridge).ok()?;
+            let phys_idx = if_nametoindex(phys).ok()?;
+            Some((bridge_idx, phys_idx, *vid))
+        })
+        .collect();
+    // Union for the diff/removal/gate logic; the ADD pass below runs
+    // subif entries before bridge aliases so that under map-capacity
+    // pressure the slot that runs out is always the optional
+    // optimization's, never a required subif entry (mirrors the
+    // attach-time population order).
+    let desired: HashSet<(u32, u32, u16)> =
+        desired_subifs.union(&desired_bridges).copied().collect();
 
     let map = state
         .ebpf
@@ -273,7 +329,14 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
         .collect();
 
     let mut delta = DeltaCount::default();
-    for (subif_idx, phys_idx, vid) in desired.difference(&current) {
+    let mut to_add: Vec<&(u32, u32, u16)> = desired.difference(&current).collect();
+    to_add.sort_by_key(|t| {
+        (
+            desired_bridges.contains(t) && !desired_subifs.contains(t),
+            t.0,
+        )
+    });
+    for (subif_idx, phys_idx, vid) in to_add.into_iter() {
         let value = VlanResolve {
             phys_ifindex: *phys_idx,
             vid: *vid,
@@ -287,7 +350,18 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
             Err(e) => warn!(subif_idx, error = %e, "VLAN_RESOLVE insert failed"),
         }
     }
+    // The diff is over full (key, value) tuples but the map is keyed
+    // on ifindex alone, so a key whose VALUE changed (same bridge,
+    // re-parented member or new VID) appears in both differences: the
+    // add pass above already wrote the new value under the key, and
+    // removing the old tuple here would delete that fresh entry —
+    // one SIGHUP would leave the key absent until the next reconcile.
+    // Skip removals for keys the desired set still contains.
+    let desired_keys: HashSet<u32> = desired.iter().map(|(k, _, _)| *k).collect();
     for (subif_idx, _, _) in current.difference(&desired) {
+        if desired_keys.contains(subif_idx) {
+            continue; // value updated in place by the add pass
+        }
         match hm.remove(subif_idx) {
             Ok(()) => {
                 delta.removed += 1;

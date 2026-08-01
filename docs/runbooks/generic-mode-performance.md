@@ -377,3 +377,98 @@ removed — budget for them instead of chasing them:
   udapi polling target forever after. That trade is usually right (fast-pathing a
   host saves far more than its poll costs) but it belongs in capacity planning,
   not in a surprised `ss --packet` session at 3am.
+
+## Bridge egress short-circuit (`bridge-resolve`)
+
+On gateway-shaped hosts, a routed egress interface is often a Linux bridge whose
+only member is a VLAN subif of a lower device (`br1337` → `switch0.1337` →
+`switch0`). Nexthops learned there carry the *bridge's* ifindex, so every
+forwarded packet the fast path redirects into `br1337` then traverses the
+software bridge (FDB lookup, ebtables), the 8021q device (tag insert), and only
+then the lower device — three `dev_queue_xmit` layers plus a per-layer AF_PACKET
+tap walk, all in softirq. On a live EFG this stack was measured carrying ~53% of
+forwarded traffic.
+
+With `bridge-resolve auto` (the default), the loader collapses that chain at
+attach/reconcile time: for every bridge whose **single forwarding member** is a
+VLAN subif, it installs a `VLAN_RESOLVE` entry keyed on the bridge ifindex, so
+the datapath pushes the 802.1Q tag itself and redirects straight to the lower
+device. No BPF code changes — the same mechanism that handles plain VLAN subif
+egress does the work.
+
+Why this is safe, and when it refuses:
+
+- The wire frame is byte-identical to what the bridge stack emits: same source
+  MAC (the bridge's — on UniFi hardware all these devices share one MAC), same
+  802.1Q VID, destination MAC from the resolved neighbor entry.
+- A single-member bridge has no port choice to make: its FDB could only ever
+  pick that member, and unknown-unicast flooding reaches exactly the same port.
+- A bridge with **two or more members — even if all but one are blocked by
+  STP** — never qualifies: a blocked port can transition to forwarding at any
+  time, and then port selection needs the FDB, which the datapath cannot
+  consult. Those bridges keep today's kernel path, automatically.
+- Member port must be in bridge state *forwarding* (`brport/state == 3`).
+
+Note what is *not* skipped: packets that egress this way bypass the bridge
+layer's ebtables hooks for forwarded traffic — consistent with the fast path's
+existing netfilter bypass on ingress, but worth knowing if ebtables rules
+target forwarded traffic on the bridge.
+
+Three scoping caveats, stated precisely:
+
+- **802.1Q only.** `/proc/net/vlan/config` lists 802.1ad (QinQ) subifs
+  indistinguishably from 802.1Q ones, and the datapath's VLAN push always
+  writes TPID 0x8100 — this is a standing assumption of the whole
+  `VLAN_RESOLVE` mechanism (plain subif entries included), not something the
+  bridge feature adds. On an 802.1ad deployment set `bridge-resolve off` and
+  don't rely on subif egress resolution either; protocol-aware resolution is
+  a named follow-up for the subsystem.
+- **`mss-clamp via <bridge>` will not match** while a short-circuit is
+  installed: clamp matching keys on the resolved egress ifindex (identical
+  pre-existing behavior for `via <subif>` under plain VLAN resolution). The
+  loader warns at attach/reconcile with the fix: scope the clamp `via` the
+  underlying device, or set `bridge-resolve off`.
+- **MTU relation is enforced:** a bridge whose MTU is smaller than its
+  underlying device's is skipped (the bridge would have refused packets the
+  short-circuit would forward). Equal MTUs — the normal case — qualify.
+- **Egress qdiscs on the bridge or subif are bypassed** — collapsed traffic
+  traverses only the underlying device's qdisc. This is the standing semantic
+  of `VLAN_RESOLVE` (plain subif entries have always redirected to the parent,
+  skipping the subif's own qdisc); shape or police on the underlying device,
+  or set `bridge-resolve off` for bridges carrying their own qdisc policy.
+  (These virtual devices are `noqueue` by default; a configured qdisc on one
+  is an operator choice this feature cannot see from procfs/sysfs.)
+- **Unicast flooding must be on** (`brport/unicast_flood == 1`, the kernel
+  default): with it off, a destination MAC absent from the FDB is dropped by
+  the bridge rather than emitted through the sole port, so "single member" no
+  longer predicts the bridge's decision. Discovery refuses such ports.
+
+**Convergence model — same as every discovery-populated map.** Chains are
+discovered at attach and re-verified on every `packetframe reconfigure`
+(SIGHUP); there is no live topology watcher, exactly as with plain VLAN-subif
+entries and redirect-target membership. If you change bridge membership (enslave
+a second port, move the subif) or flip `vlan_filtering` on a bridge that has a
+short-circuit installed, run `packetframe reconfigure` afterwards — until then
+the datapath keeps using the previously proven chain. Bridges with
+`vlan_filtering=1` never qualify at all (the per-port VLAN table can drop or
+retag in ways a static entry can't reproduce).
+
+Rollback is SIGHUP-cheap, no restart and no traffic blip:
+
+```text
+bridge-resolve off
+```
+
+then `packetframe reconfigure`. The bridge keys are purged from `VLAN_RESOLVE`
+on the spot; plain VLAN subif entries are untouched.
+
+What to watch after enabling (canary):
+
+- `/proc/net/dev`: the bridge and subif tx packet counters should collapse to
+  ~0 for fast-pathed traffic while the lower device's tx holds steady.
+- `mpstat -P ALL 10` `%soft`: the win.
+- `packetframe status`: `pass_not_in_devmap` must stay flat (the lower device
+  is enumerated into the redirect maps the same way as everything else).
+- Attach/reconcile logs: one `bridge egress short-circuit installed` line per
+  collapsed chain says discovery proved the shape; absence means the topology
+  didn't qualify and nothing changed.
