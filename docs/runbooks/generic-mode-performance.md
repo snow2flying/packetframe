@@ -116,13 +116,234 @@ Symbols to read:
 If `pskb_expand_head` + linearization dwarf `bpf_prog_run_generic_xdp`, host tuning
 and datapath placement (not BPF micro-optimization) are where the wins are.
 
+#### Measured profile on cn9670 / otx2 (2026-07-31)
+
+`perf record -F 499 -a -e cycles:k` for 10s on a live EFG at ~640 kpps, 30.6%
+idle. Aggregated by area, as a share of *busy* CPU:
+
+| Area | % of busy CPU |
+|---|---|
+| Marvell driver (`otx2_nix_cq_op_status`, `otx2_napi_handler`, `otx2_sq_append_skb`) | 11.2 |
+| **AF_PACKET tap** (`packet_rcv`, `dev_queue_xmit_nit`) | **9.1** |
+| skb alloc/free churn (`__kmalloc_node_track_caller`, `kfree`, `kmem_cache_*`) | 6.9 |
+| BPF map lookups (`trie_lookup_elem`, `longest_prefix_match`) | 5.9 |
+| Transmit (`__dev_queue_xmit`, `skb_push`, `memmove`) | 3.4 |
+| BPF programs (`fast_path`, `finalize`) | 2.6 |
+| ebtables (`ebt_do_table`) | 1.6 |
+
+**`pskb_expand_head` and `skb_linearize` do not appear at all** (below the 0.5%
+cutoff). The generic-XDP headroom-copy cost that the tc-datapath work was designed
+to escape is *not being paid* on this driver — otx2 evidently reserves enough
+headroom that `netif_receive_generic_xdp` never reallocates. Do not assume the
+generic-XDP cost model applies to your hardware without checking this first; on
+this fleet it does not, and the expected tc win is correspondingly much smaller
+than the 1.5–3× estimated from the model.
+
+Two other things worth acting on before any datapath change:
+
+- **An AF_PACKET tap costs more than the entire BPF datapath.** `packet_rcv` plus
+  `dev_queue_xmit_nit` (the transmit-side hook that feeds packet sockets) is 9.1%
+  of busy CPU. `dev_queue_xmit_nit` only runs when a tap exists. Find it with
+  `ss --packet --processes` and stop it if it isn't needed — a leftover `tcpdump`
+  or a monitoring daemon is pure overhead.
+- **Inside BPF, the map lookups cost 2.3× the program bodies.** The LPM tries
+  dominate: a forwarded packet does three (`ALLOW` src, `ALLOW` dst, `FIB`). Any
+  further BPF optimization should target lookup *count*, not instruction count.
+
+**`perf` is not available on UniFi OS.** There is no `perf` package; Debian
+bullseye ships `linux-perf` built for its own 5.10 kernel while these boxes run a
+UniFi 5.15, so `/usr/bin/perf` fails looking for `perf_5.15`. `apt install
+linux-perf` then invoking `perf_5.10` directly works (minor skew is fine for cycle
+sampling), but installing it on a forwarding router may not be worth it — the
+split below needs nothing that isn't already present.
+
+### Splitting program cost from kernel cost without perf
+
+The microbenchmark gives program ns/packet directly. Total per-packet CPU comes
+from `/proc/stat` and the module's own counters, so the kernel-side share is the
+difference. Run on a box that is actually forwarding:
+
+```sh
+S1=$(awk '/^cpu /{print $8}' /proc/stat); R1=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); sleep 10; S2=$(awk '/^cpu /{print $8}' /proc/stat); R2=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); echo "rx pps: $(( (R2-R1)/10 ))"; echo "softirq ns per rx packet: $(( (S2-S1)*10000000 / (R2-R1) ))"
+```
+
+Field 8 of `/proc/stat`'s `cpu` line is softirq in USER_HZ, which is always 100 Hz,
+so one tick is 10 ms — hence `10000000` ns. Subtract the measured program time
+(see the reference figures below) to get the kernel-side share. Softirq covers all
+softirq work on the box, not only the XDP receive path, so read it as an upper
+bound.
+
+A direct cross-check of program time under live traffic, if `bpftool` is installed
+(it is not a PacketFrame dependency):
+
+```sh
+sysctl -w kernel.bpf_stats_enabled=1 && sleep 10 && bpftool prog show name fast_path; sysctl -w kernel.bpf_stats_enabled=0
+```
+
+`run_time_ns / run_cnt` is the real per-invocation cost. Enabling the stats adds
+two timestamp reads per invocation (a few percent), so turn it off afterwards.
+
+### Getting a build onto a test router
+
+Neither the release tarballs nor the CI test runs give you what an on-hardware
+session needs: releases only exist for tags, and the test suites run on x86_64
+runners and in qemu. The `hardware-artifacts` workflow closes that gap. It runs on
+every push to `main` and publishes a `hwtest-aarch64-unknown-linux-gnu` artifact
+containing:
+
+- `packetframe_<version>~hwtest<sha>_arm64.deb` — an installable package, same
+  contents as a release .deb (binary, systemd unit, `/etc/packetframe`)
+- `tests/` — the cross-built test binaries, including `bench`
+- `run-tests.sh`, `example.conf`, and both perf runbooks
+
+Everything carries the real BPF ELF — the same bytecode a release would ship, not
+a stub.
+
+Download the bundle from the newest `main` run (`gh run download` needs an
+explicit run id or it prompts, hence the subshell):
+
+```sh
+gh run download -R unredacted/packetframe -n hwtest-aarch64-unknown-linux-gnu -D /tmp/hw "$(gh run list -R unredacted/packetframe -w 'Hardware test artifacts' -b main -s success --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+Unpack and copy to the router (swap `router` for the target host). **Not `/tmp`** —
+UniFi OS mounts it `noexec`, and since Linux `access(X_OK)` honours mount flags, a
+0755 test binary there tests as non-executable and the whole suite looks absent
+(`sudo …/run-tests.sh` reports "command not found" for a file that plainly exists).
+`run-tests.sh` detects that case and says so, but `/root` avoids it:
+
+```sh
+tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu router:/root/
+```
+
+Install it, then run the tests from the same directory:
+
+```sh
+dpkg -i /root/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*_arm64.deb && systemctl daemon-reload
+```
+
+The `daemon-reload` is not optional: the package ships
+`/lib/systemd/system/packetframe.service` but carries **no maintainer scripts**, so
+nothing reloads systemd for you and `systemctl start packetframe` can otherwise
+fail with "Unit packetframe.service not found". This is true of the release .debs
+as well — `[package.metadata.deb.systemd-units]` is configured in
+`crates/cli/Cargo.toml`, but the built package contains only `control`,
+`conffiles` and `sha256sums`.
+
+The package declares `Depends: libc6 (>= 2.31)`. If the target's libc6 is older,
+`dpkg -i` refuses; check with `dpkg -s libc6 | grep ^Version`. That's the case the
+musl variant below exists for.
+
+The `~hwtest<sha>` version sorts below every real release and is visible in
+`dpkg -l`, so a validation build can't be mistaken for one — and `apt install
+packetframe` later upgrades cleanly over it. The sha is the commit the bundle was
+built from, so `git show <sha>` tells you exactly what is on the box. To go back,
+`dpkg -r packetframe` or install a release .deb over the top.
+
+To take a bundle from a PR instead of `main` — the workflow also runs on PRs that
+change it — pass `-b <branch>` in place of `-b main`. For a different target,
+dispatch it:
+
+```sh
+gh workflow run hardware-artifacts.yml --repo unredacted/packetframe -f target=aarch64-unknown-linux-musl
+```
+
+The musl variants are statically linked and produce **no .deb** (dpkg packages
+target glibc distros). They exist as an escape hatch: if a router's glibc turns
+out to be older than the cross image's and the gnu binaries won't start, a static
+musl build has no libc dependency to satisfy.
+
+For a *signed, versioned* package, cut a tag — `release.yml` publishes tarballs
+and .debs for all four targets with reproducible timestamps and a signed
+`SHA256SUMS`. To rehearse that without publishing, dispatch it; `dry_run` defaults
+to true and skips the publish job:
+
+```sh
+gh workflow run release.yml --repo unredacted/packetframe --ref main
+```
+
 ### Program-only microbenchmark
 
 `crates/modules/fast-path/tests/bench.rs` measures ns/packet for the
 `fast_path → finalize` chain via `BPF_PROG_TEST_RUN` (kernel-timed, excludes all
-generic-XDP skb overhead). Run on any Linux host, or cross-build the test binary
-for the router (instructions in the file header). Confirm the JIT is on first —
-otherwise the bench times the interpreter.
+generic-XDP skb overhead). It runs on any Linux host, but a number from a CI
+runner tells you nothing about cn9670 cores — take the reference figures on the
+router itself, from the bundle above:
+
+```sh
+/root/packetframe-hwtest-aarch64-unknown-linux-gnu/run-tests.sh bench
+```
+
+Confirm `net.core.bpf_jit_enable=1` first (`packetframe feasibility` reports it,
+and the driver script warns) — otherwise the bench times the BPF interpreter
+rather than what production runs.
+
+#### Reference figures (cn9670)
+
+Measured 2026-07-31 on an EFG-class box (`5.15.72-ui-cn9670`, aarch64, JIT on,
+`bpf_jit_harden=0`), build `0.2.7~hwtestdd33ae7` — i.e. with the hot-path map-op
+reduction and the tc datapath in place:
+
+| Bench | ns/packet |
+|---|---|
+| `bench_allowlist_miss` | 85 |
+| `bench_custom_fib_forward_syn` | 278 |
+| `bench_custom_fib_forward_established` | 282 |
+
+Two things to read off these:
+
+- **~24 ns per map-helper call.** The forward path does 8 more map operations than
+  the miss path plus TTL/L2 mutation and a tail call; `(282 − 85) / 8 ≈ 24 ns`
+  lands inside the 20–40 ns per `bpf_map_lookup_elem` the optimization work
+  assumed, so the cost model the hot-path reduction was designed against holds on
+  this silicon.
+- **SYN and established cost the same** (278 vs 282 ns, ~1% apart — noise). With no
+  `mss-clamp` configured, the clamp lookups are gated out entirely rather than
+  being paid and discarded.
+
+**These are cache-hot, small-table numbers.** The bench populates a handful of
+FIB entries, so every LPM walk hits L1. On the reference box under live load with
+a full BGP-fed FIB, the same perf profile that produced the table above puts the
+map lookups alone (`trie_lookup_elem` + `longest_prefix_match`) at ~1.2 µs/packet
+and the program bodies at ~0.5 µs — roughly 6× the bench total, almost all of it
+LPM-walk cache misses that a small table never pays. Use the bench for
+before/after comparisons of code changes (both sides mis-cache equally); use
+`kernel.bpf_stats_enabled` + `bpftool` (above) for the absolute live cost.
+
+Note what these figures are *not*: no pre-reduction baseline was ever captured on
+this hardware, so the 23→10 map-op change cannot be quantified from them. Scaling
+the measured per-op cost suggests roughly 13 × 24 ≈ 310 ns saved, which would put
+the old path near 590 ns — but that is arithmetic on one measurement, not a
+before/after. Capturing a real baseline means building `bench` from `83badca` (the
+commit before the reduction landed) with this workflow grafted on, and is worth
+doing before quoting any improvement figure.
+
+At 282 ns of program time, one core sustains ~3.5 Mpps of pure BPF work. On a box
+that is CPU-saturated in generic mode, that is the *small* share of per-packet
+cost — use `perf top` above to size the kernel-side share before concluding the
+program is what needs optimizing.
+
+`run-tests.sh` with no arguments runs the wider correctness suite, which is worth
+doing on the box before a tc canary — it proves this kernel's verifier accepts the
+classifiers and that the fixtures produce the expected verdicts.
+
+That default selection is deliberately limited to tests that only use
+`BPF_PROG_TEST_RUN`: programs are loaded and fed synthetic packets in-kernel,
+nothing is attached to a NIC, no route/neighbour/sysctl state is touched, and
+nothing is written outside the test process — so it is safe on a forwarding
+router. Two groups are excluded and must be named explicitly:
+
+- `attach`, `tc_attach`, `netns`, `local_prefix_netns`, `neigh_resolver_netns` —
+  create interfaces or network namespaces.
+- `fib_comparison`, `fib_programmer_integration` — pin maps into a scratch
+  `/sys/fs/bpf/pftestcmp-<pid>-<n>` directory (removed on exit) and will mount
+  bpffs if it isn't already mounted.
+
+All of them clean up after themselves; they're excluded so the default run's
+"writes nothing" property holds without caveats. On a box already running
+packetframe, bpffs is of course already mounted and the tests leave it alone —
+they check before mounting, precisely so a second bpffs can never get stacked
+over the live pins.
 
 ### Counters that matter (`packetframe status`)
 
