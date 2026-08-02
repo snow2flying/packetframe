@@ -196,10 +196,11 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
 /// (`required = false`); see `docs/runbooks/generic-mode-performance.md`
 /// for what to do with the answers.
 pub fn run_iface_probes(ifaces: &[String]) -> Vec<Capability> {
-    let mut caps = Vec::with_capacity(ifaces.len() * 2);
+    let mut caps = Vec::with_capacity(ifaces.len() * 3);
     for iface in ifaces {
         caps.push(probe_iface_gro(iface));
         caps.push(probe_iface_rps(iface));
+        caps.push(probe_iface_coalesce(iface));
     }
     caps
 }
@@ -802,6 +803,172 @@ fn rps_mask_is_zero(mask: &str) -> bool {
     mask.chars().all(|c| c == '0' || c == ',')
 }
 
+/// IRQ coalescing via `SIOCETHTOOL`/`ETHTOOL_GCOALESCE`. On a
+/// generic-XDP box every packet costs a full IRQ + NAPI wakeup when
+/// the coalescing timer is effectively off; the reference EFG shipped
+/// with `rx-usecs 1 rx-frames 10`, which produced ~1 IRQ per packet
+/// (~800k/s at ~800 kpps) and measured −10.5% softirq/packet when
+/// raised to 50/32. A timer at or below this threshold cannot
+/// aggregate at realistic per-queue packet gaps (tens of µs), so it
+/// is reported as a (non-required) failure with the fix inline.
+/// See `docs/runbooks/generic-mode-performance.md` §"IRQ coalescing".
+const COALESCE_PER_PACKET_USECS: u32 = 2;
+/// A frame threshold at or below this coalesces nothing meaningful:
+/// the IRQ fires every packet (1) or every other packet (2).
+const COALESCE_PER_PACKET_FRAMES: u32 = 2;
+
+/// Does this configuration effectively interrupt per packet?
+///
+/// The uapi semantics are a DISJUNCTION — the NIC raises an IRQ when
+/// `(usecs > 0 && timer elapsed) || (frames > 0 && count reached)` —
+/// so judging on `rx_usecs` alone gets both edges wrong: `rx-usecs 0
+/// rx-frames 32` coalesces fine but would read as a failure, while
+/// `rx-usecs 50 rx-frames 1` interrupts on every packet and would
+/// read as a pass. A setting is per-packet only when EVERY armed
+/// trigger is tight; a disarmed (0) trigger can't fire at all and so
+/// never rescues the other one.
+fn coalesce_is_per_packet(rx_usecs: u32, rx_frames: u32) -> bool {
+    // Nothing armed at all: the NIC interrupts on every packet.
+    if rx_usecs == 0 && rx_frames == 0 {
+        return true;
+    }
+    // Whichever ARMED trigger fires first decides the interrupt rate,
+    // so any tight one makes the configuration per-packet and a loose
+    // one cannot rescue it. A disarmed (0) trigger never fires and is
+    // simply not considered.
+    //
+    // Calibration: the reference EFG shipped `rx-usecs 1 rx-frames 10`
+    // and measured ~800k IRQs/s at ~800 kpps — one per packet —
+    // because the 1 µs timer always beat the 10-frame count at ~24 µs
+    // per-queue packet gaps. That measurement is what the `||`
+    // encodes; an `&&` would have called that configuration healthy.
+    let timer_per_packet = rx_usecs > 0 && rx_usecs <= COALESCE_PER_PACKET_USECS;
+    let frames_per_packet = rx_frames > 0 && rx_frames <= COALESCE_PER_PACKET_FRAMES;
+    timer_per_packet || frames_per_packet
+}
+
+fn probe_iface_coalesce(iface: &str) -> Capability {
+    let name = format!("iface.{iface}.coalesce");
+    match iface_coalesce_state(iface) {
+        Ok(st) if st.adaptive_rx => Capability::unknown(
+            &name,
+            format!(
+                "adaptive RX coalescing is enabled (resting rx-usecs {} / rx-frames {}): the \
+                 driver varies these by packet rate, so the resting values do not describe \
+                 behavior under forwarding load. Measure IRQs/sec directly \
+                 (/proc/interrupts) before concluding anything",
+                st.rx_usecs, st.rx_frames
+            ),
+            false,
+        ),
+        Ok(st) => {
+            let (rx_usecs, rx_frames) = (st.rx_usecs, st.rx_frames);
+            if coalesce_is_per_packet(rx_usecs, rx_frames) {
+                Capability::fail(
+                    &name,
+                    format!(
+                        "rx-usecs {rx_usecs} / rx-frames {rx_frames}: effectively one IRQ per \
+                         packet at forwarding rates; \
+                         `ethtool -C {iface} rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32` \
+                         measured −10.5% softirq/packet on the reference EFG — settings do not \
+                         survive reboot, see generic-mode-performance runbook §IRQ coalescing \
+                         for persistence"
+                    ),
+                    false,
+                )
+            } else {
+                Capability::pass(
+                    &name,
+                    format!("rx-usecs {rx_usecs} / rx-frames {rx_frames}"),
+                    false,
+                )
+            }
+        }
+        Err(e) => Capability::unknown(&name, e, false),
+    }
+}
+
+/// The subset of `ethtool_coalesce` the verdict depends on.
+#[derive(Debug, Clone, Copy)]
+struct CoalesceState {
+    rx_usecs: u32,
+    rx_frames: u32,
+    adaptive_rx: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn iface_coalesce_state(iface: &str) -> Result<CoalesceState, String> {
+    // uapi `struct ethtool_coalesce`: cmd + 22 u32 parameter fields.
+    // Only rx_coalesce_usecs and rx_max_coalesced_frames are read;
+    // the rest exist so the kernel writes into memory we own.
+    const ETHTOOL_GCOALESCE: u32 = 0x0000_000e;
+    // Width-neutral for the ioctl request cast; see iface_gro_state.
+    const SIOCETHTOOL: u32 = 0x8946;
+    #[repr(C)]
+    #[derive(Default)]
+    struct EthtoolCoalesce {
+        cmd: u32,
+        rx_coalesce_usecs: u32,
+        rx_max_coalesced_frames: u32,
+        rx_coalesce_usecs_irq: u32,
+        rx_max_coalesced_frames_irq: u32,
+        tx_coalesce_usecs: u32,
+        tx_max_coalesced_frames: u32,
+        tx_coalesce_usecs_irq: u32,
+        tx_max_coalesced_frames_irq: u32,
+        stats_block_coalesce_usecs: u32,
+        /// Non-zero means the driver varies the RX settings by packet
+        /// rate, so the resting values above do not describe behavior
+        /// under forwarding load (a resting 50 can become 1 at rate).
+        use_adaptive_rx_coalesce: u32,
+        rest: [u32; 13],
+    }
+
+    let name_bytes = iface.as_bytes();
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name_bytes.len() >= ifr.ifr_name.len() {
+        return Err(format!("interface name `{iface}` exceeds IFNAMSIZ"));
+    }
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes) {
+        *dst = *src as libc::c_char;
+    }
+
+    let mut value = EthtoolCoalesce {
+        cmd: ETHTOOL_GCOALESCE,
+        ..Default::default()
+    };
+    ifr.ifr_ifru.ifru_data = &mut value as *mut EthtoolCoalesce as *mut libc::c_char;
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(format!(
+            "socket(AF_INET, SOCK_DGRAM) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let r = unsafe { libc::ioctl(sock, SIOCETHTOOL as _, &mut ifr) };
+    let ioctl_err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+    if r != 0 {
+        // EOPNOTSUPP is a normal answer (virtual devices, some
+        // drivers); the caller renders it as Unknown, not Fail.
+        return Err(format!(
+            "SIOCETHTOOL/ETHTOOL_GCOALESCE on {iface} failed: {ioctl_err}"
+        ));
+    }
+    Ok(CoalesceState {
+        rx_usecs: value.rx_coalesce_usecs,
+        rx_frames: value.rx_max_coalesced_frames,
+        adaptive_rx: value.use_adaptive_rx_coalesce != 0,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn iface_coalesce_state(_iface: &str) -> Result<CoalesceState, String> {
+    Err("coalescing probe is Linux-only".to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn iface_gro_state(iface: &str) -> Result<bool, String> {
     // ethtool_value { cmd, data } with ETHTOOL_GGRO. A read-only get;
@@ -861,6 +1028,39 @@ fn iface_gro_state(_iface: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalesce_per_packet_threshold() {
+        // The EFG shipped at rx-usecs 1 / rx-frames 10 (flagged); the
+        // runbook fix is 50/32 (passes).
+        assert!(coalesce_is_per_packet(1, 10));
+        assert!(!coalesce_is_per_packet(50, 32));
+
+        // Both triggers armed: whichever fires first wins, so a tight
+        // timer OR tight frame count is enough to be per-packet.
+        assert!(coalesce_is_per_packet(50, 1), "frames=1 fires every packet");
+        assert!(coalesce_is_per_packet(2, 64), "usecs=2 fires every packet");
+        assert!(!coalesce_is_per_packet(3, 3), "both just past the line");
+
+        // A disarmed (0) trigger cannot fire, so it must not rescue
+        // the other one — nor condemn it.
+        assert!(
+            !coalesce_is_per_packet(0, 32),
+            "frame-only threshold of 32 coalesces fine"
+        );
+        assert!(
+            coalesce_is_per_packet(0, 1),
+            "frame-only threshold of 1 is per-packet"
+        );
+        assert!(
+            !coalesce_is_per_packet(50, 0),
+            "timer-only threshold of 50us coalesces fine"
+        );
+        assert!(coalesce_is_per_packet(1, 0), "timer-only 1us is per-packet");
+
+        // Nothing armed at all: the NIC interrupts per packet.
+        assert!(coalesce_is_per_packet(0, 0));
+    }
 
     #[test]
     fn kconfig_flag_matching() {
@@ -987,15 +1187,17 @@ CONFIG_HZ=250
 
     #[test]
     fn iface_probes_shape() {
-        // Two caps per iface, names prefixed with the iface. On
-        // non-Linux both come back Unknown, which is fine — the shape
+        // Three caps per iface, names prefixed with the iface. On
+        // non-Linux all come back Unknown, which is fine — the shape
         // is what this asserts.
         let caps = run_iface_probes(&["eth0".to_string(), "eth1".to_string()]);
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps.len(), 6);
         assert_eq!(caps[0].name, "iface.eth0.gro");
         assert_eq!(caps[1].name, "iface.eth0.rps");
-        assert_eq!(caps[2].name, "iface.eth1.gro");
-        assert_eq!(caps[3].name, "iface.eth1.rps");
+        assert_eq!(caps[2].name, "iface.eth0.coalesce");
+        assert_eq!(caps[3].name, "iface.eth1.gro");
+        assert_eq!(caps[4].name, "iface.eth1.rps");
+        assert_eq!(caps[5].name, "iface.eth1.coalesce");
         assert!(caps.iter().all(|c| !c.required));
     }
 }
