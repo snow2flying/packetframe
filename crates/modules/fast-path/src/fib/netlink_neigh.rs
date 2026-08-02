@@ -36,7 +36,7 @@ use netlink_packet_route::{
     link::{LinkAttribute, LinkMessage},
     neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState},
     route::RouteAttribute,
-    RouteNetlinkMessage,
+    AddressFamily, RouteNetlinkMessage,
 };
 use rtnetlink::{
     new_connection, new_multicast_connection, Handle, MulticastGroup, RouteMessageBuilder,
@@ -277,6 +277,30 @@ pub struct NetlinkNeighborResolver {
     /// `None` = no fallback (default). `Some(spec)` = inject a /0
     /// RouteEvent::Add at startup once the iface is resolvable.
     fallback_default: Option<FallbackDefaultSpec>,
+    /// v0.2.9 FDB-pin chains: neighbor-bearing bridge ifindex (e.g.
+    /// br1337) → (underlying bridge whose FDB decides the member port,
+    /// e.g. switch0, egress VID). Snapshot from discovery at attach;
+    /// empty = feature off (`fdb-pin off`, or no qualifying topology).
+    /// Attach-time-bound like `local_prefixes` — topology changes need
+    /// a restart, documented in the runbook.
+    pin_chains: HashMap<u32, (u32, u16)>,
+    /// v0.2.9: bridge FDB view, `(fdb bridge ifindex, MAC)` → member
+    /// port ifindex. Seeded by an AF_BRIDGE RTM_GETNEIGH dump,
+    /// maintained by AF_BRIDGE RTM_NEWNEIGH/RTM_DELNEIGH multicasts
+    /// (which arrive on the same RTNLGRP_NEIGH group as ARP events).
+    /// Only masters present in `pin_chains` values are tracked.
+    fdb: HashMap<(u32, [u8; 6]), u32>,
+    /// v0.2.9 diagnostic: pins sent / cleared, in the periodic stats.
+    fdb_pins_sent: u64,
+    fdb_pins_cleared: u64,
+    /// v0.2.9: latest desired pin state per nexthop IP that the
+    /// programmer has NOT accepted yet (bounded command queue full).
+    /// Retried on every stats tick. This exists because unpins are
+    /// one-shot: an FDB age-out produces a single `None` transition
+    /// with no later event to regenerate it, so dropping one would
+    /// strand a nexthop pinned to an expired port. Keyed by IP with
+    /// last-write-wins, so churn collapses instead of accumulating.
+    pending_pins: HashMap<IpAddr, Option<(u32, u16)>>,
 }
 
 impl NetlinkNeighborResolver {
@@ -307,6 +331,11 @@ impl NetlinkNeighborResolver {
                 local_prefixes: Vec::new(),
                 prog_handle: None,
                 fallback_default: None,
+                pin_chains: HashMap::new(),
+                fdb: HashMap::new(),
+                fdb_pins_sent: 0,
+                fdb_pins_cleared: 0,
+                pending_pins: HashMap::new(),
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -343,6 +372,24 @@ impl NetlinkNeighborResolver {
         prog_handle: FibProgrammerHandle,
     ) -> Self {
         self.fallback_default = Some(spec);
+        if self.prog_handle.is_none() {
+            self.prog_handle = Some(prog_handle);
+        }
+        self
+    }
+
+    /// v0.2.9: enable FDB-pinned direct-to-port egress. `pin_chains`
+    /// maps a neighbor-bearing bridge ifindex to `(fdb bridge ifindex,
+    /// egress VID)` — the discovery side (linux_impl) derives it from
+    /// the same collapsed chains that feed `VLAN_RESOLVE`, restricted
+    /// to chains whose underlying device is itself a bridge. Empty map
+    /// = no-op. Builder-style like `with_local_prefixes`.
+    pub fn with_fdb_pin(
+        mut self,
+        pin_chains: HashMap<u32, (u32, u16)>,
+        prog_handle: FibProgrammerHandle,
+    ) -> Self {
+        self.pin_chains = pin_chains;
         if self.prog_handle.is_none() {
             self.prog_handle = Some(prog_handle);
         }
@@ -451,6 +498,54 @@ impl NetlinkNeighborResolver {
             "NeighborResolver netlink multicast subscription live"
         );
 
+        // v0.2.9 FDB-pin: seed the bridge FDB view and push initial
+        // pin state for every already-known neighbor on a pin chain.
+        //
+        // ORDERING IS LOAD-BEARING: this runs AFTER the multicast
+        // subscription is live, not before. Dumping first leaves a
+        // window in which an FDB entry can move or age out between the
+        // snapshot and the subscription — we would then publish the
+        // pre-move port and never see the event that corrected it,
+        // leaving traffic pinned to the wrong member port
+        // indefinitely. With the socket already open, events raised
+        // during the dump queue in the socket buffer and the select
+        // loop applies them immediately afterwards, so the window
+        // closes at the cost of replaying a few redundant updates
+        // (handle_fdb_update is idempotent last-write-wins).
+        //
+        // Dump failure degrades to "no pins yet" — the multicast
+        // maintenance rebuilds the view as entries refresh, and
+        // unpinned traffic keeps taking the bridge path it takes
+        // today.
+        if !self.pin_chains.is_empty() {
+            let parents: std::collections::HashSet<u32> = self
+                .pin_chains
+                .values()
+                .map(|&(parent, _)| parent)
+                .collect();
+            match dump_fdb(&parents).await {
+                Ok(fdb) => {
+                    info!(
+                        entries = fdb.len(),
+                        chains = self.pin_chains.len(),
+                        "bridge FDB view seeded (AF_BRIDGE RTM_GETNEIGH dump)"
+                    );
+                    self.fdb = fdb;
+                }
+                Err(e) => {
+                    warn!(error = %e, "AF_BRIDGE FDB dump failed; FDB pins deferred to multicast refresh");
+                }
+            }
+            let seeded: Vec<(IpAddr, u32, [u8; 6])> = self
+                .neigh_cache
+                .iter()
+                .map(|(ip, &(ifindex, mac))| (*ip, ifindex, mac))
+                .collect();
+            for (ip, ifindex, mac) in seeded {
+                self.maybe_send_pin(ip, ifindex, mac);
+            }
+        }
+
         // Phase 3.9 diagnostic: periodic stats so we can see whether
         // synthetic Learned events are firing for most BGP nexthops or
         // not. Cheap (single info log every 10 s).
@@ -491,6 +586,12 @@ impl NetlinkNeighborResolver {
                                     .get(&ifindex)
                                     .copied()
                                     .unwrap_or([0; 6]);
+                                // v0.2.9: pin state must reach the
+                                // programmer before (or with) the
+                                // Learned that triggers the entry
+                                // write; the pins map is consulted at
+                                // write time, so send it first.
+                                self.maybe_send_pin(ip, ifindex, mac);
                                 let evt = NeighEvent::Learned { ip, mac, ifindex, src_mac };
                                 match self.events_tx.send(evt).await {
                                     Ok(()) => {
@@ -535,8 +636,17 @@ impl NetlinkNeighborResolver {
                         local_arp_routes_removed = self.local_arp_routes_removed,
                         local_nd_routes_added = self.local_nd_routes_added,
                         local_nd_routes_removed = self.local_nd_routes_removed,
+                        fdb_entries = self.fdb.len(),
+                        fdb_pins_sent = self.fdb_pins_sent,
+                        fdb_pins_cleared = self.fdb_pins_cleared,
+                        fdb_pins_pending = self.pending_pins.len(),
                         "neighbour resolver stats"
                     );
+                    // Unpins are one-shot; a dropped one would strand a
+                    // nexthop on an expired port. Retry here rather
+                    // than relying on a future event that may never
+                    // come.
+                    self.retry_pending_pins();
                 }
             }
         }
@@ -553,6 +663,13 @@ impl NetlinkNeighborResolver {
     async fn handle_packet(&mut self, packet: NetlinkMessage<RouteNetlinkMessage>) {
         match packet.payload {
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) => {
+                // v0.2.9: AF_BRIDGE RTM_NEWNEIGH is an FDB entry, not
+                // an ARP/ND neighbour — it carries a MAC + port but no
+                // IP, so it must divert before parse_neighbour_add.
+                if msg.header.family == AddressFamily::Bridge {
+                    self.handle_fdb_update(&msg, true);
+                    return;
+                }
                 let src_mac = self
                     .iface_mac
                     .get(&msg.header.ifindex)
@@ -568,6 +685,11 @@ impl NetlinkNeighborResolver {
                     } = &evt
                     {
                         self.neigh_cache.insert(*ip, (*ifindex, *mac));
+                        // v0.2.9: (re-)derive this neighbor's FDB pin —
+                        // a MAC change lands here and must move or
+                        // clear the pin before the Learned write races
+                        // stale pin state.
+                        self.maybe_send_pin(*ip, *ifindex, *mac);
                         // v0.2.1: if this neighbour falls in a configured
                         // local-prefix and is reachable via the matching
                         // iface, emit a /32 RouteEvent::Add. The
@@ -584,6 +706,13 @@ impl NetlinkNeighborResolver {
                 }
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelNeighbour(msg)) => {
+                // v0.2.9: AF_BRIDGE FDB removal (age-out, port change,
+                // flush). Unpins affected nexthops → they fall back to
+                // the bridge path until the FDB relearns.
+                if msg.header.family == AddressFamily::Bridge {
+                    self.handle_fdb_update(&msg, false);
+                    return;
+                }
                 // Capture ifindex before we move msg into parse_neighbour_del.
                 let ifindex = msg.header.ifindex;
                 if let Some(evt) = parse_neighbour_del(&msg) {
@@ -639,6 +768,154 @@ impl NetlinkNeighborResolver {
                 warn!(?err, "netlink error message");
             }
             _ => {}
+        }
+    }
+
+    /// v0.2.9: derive and send the FDB pin for one neighbor. No-op
+    /// unless `ifindex` is a pin-chain bridge. Sends `Some((port,
+    /// vid))` when the underlying bridge's FDB places `mac` behind a
+    /// member port, `None` (explicit un-pin) otherwise — the explicit
+    /// clear matters when a neighbor's MAC changes or its FDB entry
+    /// ages out, so a stale pin can never outlive the evidence for it.
+    /// Idempotent by construction; the programmer absorbs repeats.
+    fn maybe_send_pin(&mut self, ip: IpAddr, ifindex: u32, mac: [u8; 6]) {
+        if self.prog_handle.is_none() {
+            return;
+        }
+        let Some(&(parent, vid)) = self.pin_chains.get(&ifindex) else {
+            // The nexthop is NOT on a pin chain — but it may have been
+            // a moment ago. The programmer deliberately retains pins
+            // across Gone/unregister/re-register, so returning early
+            // here would let a later Learned event on the new
+            // interface consult the OLD pin and write the new MAC with
+            // the previous bridge member's port and VID. Routing moving
+            // a nexthop off a pinned bridge is exactly the case. Send
+            // an explicit clear instead; the programmer absorbs the
+            // no-op when nothing was pinned.
+            self.queue_pin(ip, None);
+            return;
+        };
+        let pin = self.fdb.get(&(parent, mac)).map(|&port| (port, vid));
+        if pin.is_some() {
+            self.fdb_pins_sent += 1;
+        } else {
+            self.fdb_pins_cleared += 1;
+        }
+        self.queue_pin(ip, pin);
+    }
+
+    /// Send a pin transition, retaining it for retry if the
+    /// programmer's bounded queue rejected it. See `pending_pins`.
+    fn queue_pin(&mut self, ip: IpAddr, pin: Option<(u32, u16)>) {
+        let accepted = match self.prog_handle.as_ref() {
+            Some(prog) => prog.set_nexthop_pin_nowait(ip, pin),
+            None => return,
+        };
+        if accepted {
+            self.pending_pins.remove(&ip);
+        } else {
+            self.pending_pins.insert(ip, pin);
+        }
+    }
+
+    /// Re-send pin transitions the programmer could not accept.
+    /// Driven from the stats tick so retries are bounded and cheap.
+    fn retry_pending_pins(&mut self) {
+        if self.pending_pins.is_empty() {
+            return;
+        }
+        let retry: Vec<(IpAddr, Option<(u32, u16)>)> =
+            self.pending_pins.iter().map(|(ip, p)| (*ip, *p)).collect();
+        let before = retry.len();
+        for (ip, pin) in retry {
+            self.queue_pin(ip, pin);
+        }
+        let still = self.pending_pins.len();
+        if still > 0 {
+            warn!(
+                retried = before,
+                still_pending = still,
+                "FDB-pin retries still blocked; programmer queue remains saturated"
+            );
+        } else {
+            info!(retried = before, "FDB-pin retries drained");
+        }
+    }
+
+    /// v0.2.9: apply one AF_BRIDGE FDB event (`added == true` for
+    /// RTM_NEWNEIGH, false for RTM_DELNEIGH) and re-derive the pin of
+    /// every cached neighbor whose MAC + chain matches. FDB events
+    /// carry `(port ifindex, MAC, master)`; entries whose master isn't
+    /// a pin-chain parent are ignored (dockers, unrelated bridges).
+    /// Events without an NDA_MASTER/Controller attribute are skipped —
+    /// port-local (`self`) FDB entries, which never describe a path
+    /// through the bridge.
+    fn handle_fdb_update(&mut self, msg: &NeighbourMessage, added: bool) {
+        if self.pin_chains.is_empty() {
+            return;
+        }
+        let Some(master) = extract_fdb_master(&msg.attributes) else {
+            return;
+        };
+        let parents: std::collections::HashSet<u32> =
+            self.pin_chains.values().map(|&(p, _)| p).collect();
+        if !parents.contains(&master) {
+            return;
+        }
+        // Defence in depth on FDB keying. `discover_fdb_pin_chains`
+        // refuses VLAN-filtering underlying bridges precisely because
+        // their FDB is keyed by (MAC, VID) while this cache is keyed
+        // by (master, MAC). If a VLAN-tagged FDB entry reaches us
+        // anyway — filtering flipped on after attach, or a kernel that
+        // reports a VID regardless — ignoring it is the safe answer:
+        // the nexthop stays unpinned on the bridge path rather than
+        // being pinned from a key we cannot disambiguate.
+        if msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, NeighbourAttribute::Vlan(v) if *v != 0))
+        {
+            return;
+        }
+        let Some(mac) = extract_mac(&msg.attributes) else {
+            return;
+        };
+        let port = msg.header.ifindex;
+        let changed = if added {
+            self.fdb.insert((master, mac), port) != Some(port)
+        } else {
+            // Only forget the mapping the delete describes: an age-out
+            // notification for the OLD port must not clobber a newer
+            // entry from a MAC move that already arrived.
+            match self.fdb.get(&(master, mac)) {
+                Some(&cur) if cur == port => {
+                    self.fdb.remove(&(master, mac));
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !changed {
+            return;
+        }
+        // Re-derive pins for every cached neighbor with this MAC on a
+        // chain over this master. Neighbor counts are small (hundreds)
+        // and FDB churn for *nexthop* MACs is rare; a linear scan is
+        // simpler than a reverse index and cheap at this rate.
+        let affected: Vec<(IpAddr, u32, [u8; 6])> = self
+            .neigh_cache
+            .iter()
+            .filter(|(_, &(nifidx, nmac))| {
+                nmac == mac
+                    && self
+                        .pin_chains
+                        .get(&nifidx)
+                        .is_some_and(|&(p, _)| p == master)
+            })
+            .map(|(ip, &(nifidx, nmac))| (*ip, nifidx, nmac))
+            .collect();
+        for (ip, nifidx, nmac) in affected {
+            self.maybe_send_pin(ip, nifidx, nmac);
         }
     }
 
@@ -1338,6 +1615,53 @@ fn extract_mac(attrs: &[NeighbourAttribute]) -> Option<[u8; 6]> {
         }
     }
     None
+}
+
+/// v0.2.9: pull the bridge-master ifindex out of an AF_BRIDGE FDB
+/// message. netlink-packet-route 0.30 decodes NDA_MASTER as
+/// `Controller` (the crate's rename of the master terminology).
+fn extract_fdb_master(attrs: &[NeighbourAttribute]) -> Option<u32> {
+    for attr in attrs {
+        if let NeighbourAttribute::Controller(ifindex) = attr {
+            return Some(*ifindex);
+        }
+    }
+    None
+}
+
+/// v0.2.9: AF_BRIDGE RTM_GETNEIGH dump — the bridge FDB. Returns
+/// `(master, MAC) → port ifindex` for masters in `parents`. Same
+/// dedicated-unicast-connection pattern as [`dump_neighbours`];
+/// `message_mut()` overrides the family because rtnetlink's typed
+/// `set_family` only speaks v4/v6.
+async fn dump_fdb(
+    parents: &std::collections::HashSet<u32>,
+) -> Result<HashMap<(u32, [u8; 6]), u32>, NeighError> {
+    let (connection, handle, _) =
+        new_connection().map_err(|e| NeighError::new(format!("new_connection: {e}")))?;
+    tokio::spawn(connection);
+
+    let mut out: HashMap<(u32, [u8; 6]), u32> = HashMap::new();
+    let mut req = handle.neighbours().get();
+    req.message_mut().header.family = AddressFamily::Bridge;
+    let mut entries = req.execute();
+    while let Some(msg) = entries
+        .try_next()
+        .await
+        .map_err(|e| NeighError::new(format!("AF_BRIDGE neighbour dump: {e}")))?
+    {
+        let Some(master) = extract_fdb_master(&msg.attributes) else {
+            continue; // port-local (self) entry; not a bridge path
+        };
+        if !parents.contains(&master) {
+            continue;
+        }
+        let Some(mac) = extract_mac(&msg.attributes) else {
+            continue;
+        };
+        out.insert((master, mac), msg.header.ifindex);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

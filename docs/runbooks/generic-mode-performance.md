@@ -566,6 +566,62 @@ v0.2.8 hot-path reductions, box-level softirq fell 15,433 → 11,306 ns/packet
 whole-campaign delta against the pre-v0.2.8 release binary, including diurnal
 mix shift; per-feature attribution needs a brief `fib-cache off` window.
 
+## FDB-pinned direct-to-port egress (`fdb-pin`, v0.2.9)
+
+The short-circuit above still leaves one bridge hop: a chain like `br1337 →
+switch0.1337 → switch0 (bridge over eth0/4/5)` redirects to `switch0`, whose
+transmit path picks the member port from its FDB and then runs
+`dev_queue_xmit` on it — paying the FDB lookup, ebtables, the member port's
+egress qdisc (`fq` on the reference EFG), and the AF_PACKET tap walk
+(`dev_queue_xmit_nit`, the cost the 2026-08-01 full-scale tc test measured
+brutally). `fdb-pin` removes that hop too: the NeighborResolver mirrors the
+underlying bridge's FDB (AF_BRIDGE dump + live RTM_NEWNEIGH/DELNEIGH events)
+and, per nexthop MAC, pins the nexthop entry straight to the member port +
+VID. `generic_xdp_tx` on the port then bypasses qdisc and taps entirely.
+
+Mechanism and safety:
+
+- The pin lives **inside the existing `NEXTHOPS` seqlock entry** (`pin_vid`
+  in former padding — same size, same offsets), so pin/unpin transitions are
+  atomic with the ifindex they describe, and the datapath *skips* the
+  `VLAN_RESOLVE` lookup for pinned nexthops (one map op cheaper than the
+  unpinned path).
+- **No FDB answer → no pin.** The nexthop keeps the bridge path; unknown
+  unicast keeps flooding exactly as the kernel would. Wrong-pin exposure is
+  bounded by FDB notification latency: a MAC move emits RTM_NEWNEIGH and the
+  pin follows within the event round-trip.
+- **FDB age-out unpins** (fall back to the bridge path) until the entry
+  relearns. On a box where forwarded traffic bypasses the bridge, relearning
+  rides host-path traffic — ARP/ND keepalives, and on UniFi OS udapi's
+  neighbor polling (the one time that tax pays us back). Sustained flapping
+  would show as `fdb_pins_sent`/`fdb_pins_cleared` churning in the resolver's
+  periodic stats line.
+- Requires `bridge-resolve` active — the pin extends the same
+  wire-equivalence proof (identical frame bytes; all chain devices share one
+  MAC on the reference platform). Restart-only, like `local-prefix`.
+- **Default OFF; `fdb-pin on` is an explicit opt-in.** The short-circuit
+  reasons from static topology; pinning additionally depends on live bridge
+  learning, so it stays opt-in until it has soaked on hardware. It is also
+  refused under `forwarding-mode compare` (a pinned egress reads as
+  `CompareDisagree` against the kernel FIB's bridge ifindex and would corrupt
+  pre-cutover validation) and warns as inert under `kernel-fib`.
+- **The underlying bridge must not be VLAN-filtering.** A filtering bridge
+  applies per-port VLAN policy on egress that a static pin cannot reproduce,
+  and keys its FDB by `(MAC, VID)` rather than MAC alone. Such chains are
+  skipped, and any VLAN-tagged FDB entry that reaches the resolver anyway is
+  ignored rather than pinned from an ambiguous key.
+- **`mss-clamp via <iface>` does not survive pinning.** Clamp matching keys on
+  the resolved egress ifindex, which for a pinned nexthop is a
+  dynamically-chosen member port with no stable name. Attach warns when a
+  clamp names an affected interface; use a prefix-scoped or global clamp, or
+  leave `fdb-pin` off.
+
+Verification on hardware: `/proc/net/dev` — `switch0` tx pps collapses for
+fast-pathed traffic while the member port's tx holds; `tc -s qdisc show dev
+eth4` — fq `Sent` counters stop growing at the forwarded rate;
+`fdb_pins_sent` in the resolver stats ≈ your pinned nexthop count. Rollback:
+`fdb-pin off` + restart.
+
 ## FIB destination cache (`fib-cache`, experiment)
 
 Live profiling showed the custom-FIB LPM walks are the dominant *BPF-side* cost
