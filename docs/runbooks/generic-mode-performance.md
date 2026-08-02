@@ -164,7 +164,7 @@ from `/proc/stat` and the module's own counters, so the kernel-side share is the
 difference. Run on a box that is actually forwarding:
 
 ```sh
-S1=$(awk '/^cpu /{print $8}' /proc/stat); R1=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); sleep 10; S2=$(awk '/^cpu /{print $8}' /proc/stat); R2=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); echo "rx pps: $(( (R2-R1)/10 ))"; echo "softirq ns per rx packet: $(( (S2-S1)*10000000 / (R2-R1) ))"
+S1=$(awk '/^cpu /{print $8}' /proc/stat); R1=$(packetframe status | awk '$1=="rx_total"{print $2}'); sleep 10; S2=$(awk '/^cpu /{print $8}' /proc/stat); R2=$(packetframe status | awk '$1=="rx_total"{print $2}'); echo "rx pps: $(( (R2-R1)/10 ))"; echo "softirq ns per rx packet: $(( (S2-S1)*10000000 / (R2-R1) ))"
 ```
 
 Field 8 of `/proc/stat`'s `cpu` line is softirq in USER_HZ, which is always 100 Hz,
@@ -471,7 +471,17 @@ What to watch after enabling (canary):
   is enumerated into the redirect maps the same way as everything else).
 - Attach/reconcile logs: one `bridge egress short-circuit installed` line per
   collapsed chain says discovery proved the shape; absence means the topology
-  didn't qualify and nothing changed.
+  didn't qualify and nothing changed. (The SIGHUP path logs `VLAN_RESOLVE
+  added` per alias instead — count those against your bridge list.)
+
+**Measured result (2026-08-01, reference EFG):** with the short-circuit active,
+br1337's tx collapsed 318,491 → 4,382 pps (−98.6%; the residual is
+host-originated traffic), switch0 carried the flow directly, and
+`pass_not_in_devmap` stayed pinned at 0. Combined with `fib-cache on` and the
+v0.2.8 hot-path reductions, box-level softirq fell 15,433 → 11,306 ns/packet
+(−26.7%) while throughput rose 640k → 766k pps — stated honestly as the
+whole-campaign delta against the pre-v0.2.8 release binary, including diurnal
+mix shift; per-feature attribution needs a brief `fib-cache off` window.
 
 ## FIB destination cache (`fib-cache`, experiment)
 
@@ -505,10 +515,39 @@ hit_rate = fib_cache_hit / (fib_cache_hit + fib_cache_miss + fib_cache_stale)
 ```
 
 - **≥ 70%** and the LPM share of CPU visibly down → keep it on.
-- **30–70%** → marginal; keep only if the CPU delta justifies 27 MB.
+- **30–70%** → marginal; keep only if the CPU delta justifies ~37 MB.
 - **< 30%**, or `fib_cache_stale` > ~20% of probes sustained → your destination
   diversity or route churn defeats this cache design; turn it off and leave it
   off. The counters stay (append-only) as a record.
+
+**Preliminary result (2026-08-01, reference EFG, full BGP table, ~770 kpps) —
+NOT yet a KEEP verdict.** A steady-state 60 s delta taken ~2 h after enabling
+showed **hit 91.2% / miss 2.3% / stale 6.5%** at 772k probes/s. That clears the
+≥70% hit-rate leg of the criterion on a short window, and it is early evidence
+that the route-cache-thrash fear does not materialize on real internet-edge
+traffic — but **both remaining legs are outstanding**, so the cache is on
+provisionally, not proven:
+
+- *Sustained churn (≥24 h):* one hour-scale window does not cover a full
+  diurnal cycle of BGP churn. Re-run the delta below at several points across a
+  day; `fib_cache_stale` is the number that moves if churn is the problem.
+- *LPM CPU share visibly down:* not demonstrated. The −26.7% softirq/packet
+  above is a whole-campaign figure that also contains the bridge short-circuit,
+  the v0.2.8 hot-path reductions, and traffic-mix drift. Isolating the cache
+  needs a brief `fib-cache off` window (SIGHUP, no restart) with `perf` before
+  and after, comparing the `trie_lookup_elem` + `longest_prefix_match` share.
+
+Until both are recorded here, treat ~37 MB of per-CPU memory as an unproven
+cost. If either leg fails, `fib-cache off` is the answer and this section should
+say so. Two measurement traps hit live,
+recorded so nobody repeats them: snapshots taken during a table (re)load are
+meaningless (initial convergence bumps the generation per route write; 51%
+stale was observed mid-load), and the cumulative counters embed that window
+forever — always judge with a delta over a steady-state interval:
+
+```sh
+A=$(packetframe status | awk '/fib_cache_hit/{h=$2}/fib_cache_miss/{m=$2}/fib_cache_stale/{s=$2}END{print h,m,s}'); sleep 60; B=$(packetframe status | awk '/fib_cache_hit/{h=$2}/fib_cache_miss/{m=$2}/fib_cache_stale/{s=$2}END{print h,m,s}'); echo $A $B | awk '{dh=$4-$1; dm=$5-$2; ds=$6-$3; t=dh+dm+ds; printf "cache (last 60s): hit %.1f%%  miss %.1f%%  stale %.1f%%\n", 100*dh/t, 100*dm/t, 100*ds/t}'
+```
 
 `fib-cache off` + reconfigure disables it immediately (the BPF probe stops on the
 next packet); re-enabling never resurrects pre-disable entries (the generation
