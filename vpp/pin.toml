@@ -1,0 +1,65 @@
+# VPP upstream pin for the vpp-offload module (phase 4).
+#
+# THIS FILE IS THE BUILD TRIGGER. Editing it runs
+# `.github/workflows/vpp-build.yml`, which builds *unmodified upstream*
+# VPP inside a `debian:bullseye` container on a native arm64 runner and
+# publishes the .debs + API definitions under their own release tag.
+# Nothing else triggers that build — packetframe releases deliberately
+# do not, because VPP's artifacts are a function of this pin alone and
+# rebuilding them per release would burn ~45 min of CI reproducing
+# byte-identical output.
+#
+# Why we build at all (settled empirically 2026-08-01/02). Precisely:
+# fd.io DOES publish Debian bullseye packages in its per-release
+# repos (fdio/<YYMM>) — but amd64 only. Its arm64 builds are
+# Ubuntu-only (jammy/noble). So bullseye+arm64, the one combination
+# UniFi OS can install, is published nowhere at any version, and
+# Debian has never packaged VPP. Substituting the jammy arm64 deb
+# fails three ways: bullseye's dpkg can't unpack its zstd members, and
+# its symbol floor is GLIBC_2.34 against our 2.31. See
+# docs/runbooks/vpp-offload-spike.md.
+#
+# We ship NO patches. This is repackaging, not forking.
+
+[vpp]
+# Git ref in github.com/FDio/vpp. Use a release tag, never a branch:
+# branches move, and a moving pin defeats the point.
+#
+# Latest upstream stable release, and PROVISIONAL only in the sense
+# that gate 0b must confirm the DPDK↔AF mailbox handshake on the
+# reference hardware before we depend on it.
+#
+# Default to newest, not oldest. Newest gets security fixes and
+# upstream support; you drop back only when something forces you to,
+# and "might not build" was not a good enough reason — VPP's Makefile
+# in stable/2606 has explicit `debian-11` handling, so bullseye is a
+# supported build host. (An earlier version of this file pinned 23.06
+# on the assumption that newer lines had dropped Debian 11. That was
+# inferred from fd.io's *package* matrix, which describes their CI,
+# not what the source can build. Checked, wrong, corrected.)
+#
+# The one genuine risk with newness is the AF↔VF mailbox: this fleet
+# runs a 5.15 vendor kernel whose AF is SDK-era, and gate 0a's
+# handshake passed with DPDK 20.11's `octeontx2` PMD. A modern cnxk
+# PMD may or may not agree with it — the mailbox does not follow
+# newer-is-better. That is a question for MEASUREMENT, not for
+# pre-emptive downgrading. Fallback ladder if gate 0b's handshake
+# fails, in order:
+#   v25.10 / v24.10  → newer cnxk, still recent
+#   v23.06           → last line before the cnxk-era churn
+#   v22.02           → DPDK 21.11, last `octeontx2`-named PMD, closest
+#                      to the DPDK 20.11 build that passed gate 0a
+ref = "v26.06"
+
+# Optional strict pin. When non-empty the workflow verifies the ref
+# resolves to exactly this commit and fails otherwise, so a retagged
+# upstream can't silently change what we ship. Recorded in the
+# published manifest either way.
+commit = ""
+
+# Build variant. "generic" = baseline armv8-a, portable across any
+# arm64 EFG-class box. "cn9k" = Marvell-tuned (LSE atomics, tuned
+# memcpy) — a few percent on atomics/copy-heavy paths, only worth
+# measuring once we are packet-rate-bound. Changing this produces a
+# separately-tagged artifact; both can coexist.
+platform = "generic"
