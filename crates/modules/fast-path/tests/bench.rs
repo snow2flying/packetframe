@@ -62,13 +62,38 @@ const LO_IFINDEX: u32 = 1;
 /// splat to the emulated serial console compounds the slowdown until
 /// the job times out (observed on the v0.2.8 fib-cache PR: 5.15 qemu
 /// job dead at 20 min with bench still running). CI's question is
-/// "does the bench run and do its sanity asserts hold", which 1/25th
-/// of the iterations answers identically.
-fn bench_calls(full: usize) -> usize {
+/// "does the bench run and do its sanity asserts hold", which a
+/// fraction of the iterations answers identically.
+///
+/// Quick mode must bound BOTH knobs, and bound them HARD. Two rounds
+/// of evidence shaped these numbers:
+///
+/// 1. The watchdog's unit of concern is one uninterruptible
+///    `bpf_test_run` syscall, so dividing the call count alone is not
+///    enough: a 10_000-repeat syscall runs ~20 s of kernel time on a
+///    slow TCG runner, straddling the 22 s line (PR #81: 6.6 green in
+///    11 min, 5.15 watchdog-cascaded into the 20-min timeout on
+///    identical code).
+/// 2. Capping repeat at 1_000 was still not enough. PR #86's 5.15 job
+///    soft-locked in a FORWARD bench, whose repeat is only 200 — the
+///    cap never applied. What killed it was total volume: 200 calls ×
+///    200 repeats = 40k executions, and TCG is slow enough that the
+///    aggregate stalled a CPU past the watchdog anyway.
+///
+/// So quick mode now targets a few hundred executions per bench, not a
+/// few tens of thousands. CI's question is "does the bench run and do
+/// its sanity asserts hold" — the `FwdOk`/`RxTotal` delta assertions
+/// and the TTL-budget guard are exactly as strong at 400 executions as
+/// at 1M, and the ns/pkt figures were never meaningful under emulation
+/// anyway (hardware runs full mode via the hwtest bundle).
+const QUICK_MAX_REPEAT: u32 = 50;
+const QUICK_MAX_CALLS: usize = 8;
+
+fn bench_params(repeat: u32, calls: usize) -> (u32, usize) {
     if std::env::var_os("PACKETFRAME_BENCH_QUICK").is_some() {
-        (full / 25).max(8)
+        (repeat.min(QUICK_MAX_REPEAT), calls.min(QUICK_MAX_CALLS))
     } else {
-        full
+        (repeat, calls)
     }
 }
 
@@ -137,18 +162,16 @@ fn bench_custom_fib_forward_established() {
     let fwd_before = h.stat(StatIdx::FwdOk);
     let low_ttl_before = h.stat(StatIdx::PassLowTtl);
 
-    let calls = bench_calls(FWD_CALLS);
-    let ns = median_ns(&h, &pkt, FWD_REPEAT, calls, xdp_action::XDP_REDIRECT);
+    let (repeat, calls) = bench_params(FWD_REPEAT, FWD_CALLS);
+    let ns = median_ns(&h, &pkt, repeat, calls, xdp_action::XDP_REDIRECT);
 
     // Every iteration must have forwarded; a TTL-budget bug would
     // divert iterations to PassLowTtl and quietly bench the wrong path.
-    let executed = (FWD_REPEAT as u64) * (calls as u64);
+    let executed = (repeat as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::FwdOk) - fwd_before, executed);
     assert_eq!(h.stat(StatIdx::PassLowTtl), low_ttl_before);
 
-    eprintln!(
-        "bench_custom_fib_forward_established: {ns} ns/pkt (median of {calls} x {FWD_REPEAT})"
-    );
+    eprintln!("bench_custom_fib_forward_established: {ns} ns/pkt (median of {calls} x {repeat})");
 
     if let Ok(baseline) = std::env::var("PACKETFRAME_BENCH_BASELINE_NS") {
         let baseline: u32 = baseline
@@ -168,12 +191,12 @@ fn bench_custom_fib_forward_syn() {
     let pkt = fwd_packet(TCP_FLAG_SYN);
 
     let fwd_before = h.stat(StatIdx::FwdOk);
-    let calls = bench_calls(FWD_CALLS);
-    let ns = median_ns(&h, &pkt, FWD_REPEAT, calls, xdp_action::XDP_REDIRECT);
-    let executed = (FWD_REPEAT as u64) * (calls as u64);
+    let (repeat, calls) = bench_params(FWD_REPEAT, FWD_CALLS);
+    let ns = median_ns(&h, &pkt, repeat, calls, xdp_action::XDP_REDIRECT);
+    let executed = (repeat as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::FwdOk) - fwd_before, executed);
 
-    eprintln!("bench_custom_fib_forward_syn: {ns} ns/pkt (median of {calls} x {FWD_REPEAT})");
+    eprintln!("bench_custom_fib_forward_syn: {ns} ns/pkt (median of {calls} x {repeat})");
 }
 
 #[test]
@@ -186,10 +209,10 @@ fn bench_allowlist_miss() {
     let pkt = Ipv4TcpBuilder::default().build();
 
     let rx_before = h.stat(StatIdx::RxTotal);
-    let calls = bench_calls(MISS_CALLS);
-    let ns = median_ns(&h, &pkt, MISS_REPEAT, calls, xdp_action::XDP_PASS);
-    let executed = (MISS_REPEAT as u64) * (calls as u64);
+    let (repeat, calls) = bench_params(MISS_REPEAT, MISS_CALLS);
+    let ns = median_ns(&h, &pkt, repeat, calls, xdp_action::XDP_PASS);
+    let executed = (repeat as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::RxTotal) - rx_before, executed);
 
-    eprintln!("bench_allowlist_miss: {ns} ns/pkt (median of {calls} x {MISS_REPEAT})");
+    eprintln!("bench_allowlist_miss: {ns} ns/pkt (median of {calls} x {repeat})");
 }
